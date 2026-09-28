@@ -43,6 +43,15 @@ void gnss_report_ttff_if_needed(void);
 
 // GNSS通信函数
 void gnss_send_nmea(const char* sentence);
+// 发送 $<body>*<校验和>\r\n，body 不含 '$'、'*' 和校验和
+void gnss_send_nmea_cs(const char* body);
+
+// 低功耗协议探测：让模组自己说明它认哪套命令（约 40 秒，结果打在串口）
+// 调用前 gnss_init() 必须已执行、gnss_task 必须已在运行
+void gnss_lp_probe_run(void);
+
+// 使能星历自动存 Flash（CFG-EPHSAVE），Backup 唤醒后才能热启动
+bool gnss_enable_ephemeris_save(void);
 void gnss_send_ubx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len);
 void gnss_send_quectel_bin(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len);
 

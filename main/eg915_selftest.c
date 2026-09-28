@@ -479,6 +479,22 @@ void Selftest_task(void *pv)
     selftest_gnss(&rep);
     selftest_leds(&rep);
 
+#if GNSS_LP_SELFTEST
+    /* GNSS 低功耗协议探测。需要 gnss_task 在跑才能收到模组的回应，
+     * 自测模式下平时不起这个任务，这里单独拉起来。 */
+    if (rep.gnss_uart_ok) {
+        static bool gnss_task_started = false;
+        if (!gnss_task_started) {
+            xTaskCreate(gnss_task, "gnss_task", 6144, NULL, 8, NULL);
+            gnss_task_started = true;
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        gnss_lp_probe_run();
+    } else {
+        ESP_LOGW(TAG_ST, "GNSS 无输出，跳过低功耗协议探测");
+    }
+#endif
+
     // 3. 输出结果：表格 + 文字汇总 + JSON，全部走 USB-JTAG 调试口
     print_formatted_result(&rep);
     print_human_summary(&rep);

@@ -14,9 +14,24 @@
 #include "timer_module.h"
 #include "motion_sensor.h"
 #include "button_module.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "eg915_selftest.h"
 
 static const char *TAG = "APP";
+
+#if ENABLE_DEEP_SLEEP
+/* RTC 慢速内存里的计数器，deep sleep 不会清零。
+ * 串口在深睡时会断开枚举，重连后看这个数就知道中间醒过几轮。 */
+RTC_DATA_ATTR static uint32_t s_boot_count = 0;
+RTC_DATA_ATTR static uint32_t s_fix_ok_count = 0;
+RTC_DATA_ATTR static uint32_t s_pub_ok_count = 0;
+
+uint32_t app_get_boot_count(void)   { return s_boot_count; }
+void app_note_fix_ok(void)          { s_fix_ok_count++; }
+void app_note_publish_ok(void)      { s_pub_ok_count++; }
+#endif
+
 
 void app_main(void)
 {
@@ -35,6 +50,50 @@ void app_main(void)
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 #else
+
+#if ENABLE_DEEP_SLEEP
+    /* 先报告本次是怎么起来的。deep sleep 醒来等同复位，所以每轮都会走一遍
+     * app_main，RAM 状态全部重置——IMEI、APN 这些每轮重新取。 */
+    {
+        esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+        s_boot_count++;
+
+        ESP_LOGI(TAG, "==================================================");
+        ESP_LOGI(TAG, " 第 %lu 次启动（RTC 计数器，deep sleep 不清零）",
+                 (unsigned long)s_boot_count);
+        switch (wc) {
+            case ESP_SLEEP_WAKEUP_TIMER:
+                ESP_LOGI(TAG, " 唤醒原因：deep sleep 定时器到期（正常上报轮次）");
+                break;
+            case ESP_SLEEP_WAKEUP_EXT0:
+                ESP_LOGI(TAG, " 唤醒原因：IO%d 按键（手动触发）", BUTTON_PIN);
+                break;
+            default:
+                ESP_LOGI(TAG, " 唤醒原因：上电 / 复位（首次启动，计数器已归零）");
+                s_fix_ok_count = 0;
+                s_pub_ok_count = 0;
+                break;
+        }
+        ESP_LOGI(TAG, " 历史统计：定位成功 %lu 次，上报成功 %lu 次",
+                 (unsigned long)s_fix_ok_count, (unsigned long)s_pub_ok_count);
+        ESP_LOGI(TAG, "==================================================");
+
+        // 解除 deep sleep 期间的引脚保持，否则后面 gpio_set_level 写不进去
+        deep_sleep_release_pins();
+
+        /* 开机指示：ESP_LED 按启动次数闪（最多 5 下）。
+         * 串口在深睡时会断开，这个闪灯是不依赖串口就能确认"确实醒了"的证据。 */
+        gpio_reset_pin(LED_ESP_PIN);
+        gpio_set_direction(LED_ESP_PIN, GPIO_MODE_OUTPUT);
+        int blinks = (int)(s_boot_count > 5 ? 5 : s_boot_count);
+        for (int i = 0; i < blinks; ++i) {
+            gpio_set_level(LED_ESP_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            gpio_set_level(LED_ESP_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(120));
+        }
+    }
+#endif
 
     // 1. 初始化GPIO（含电子围栏引脚安全状态）
     gpio_init();
@@ -64,7 +123,8 @@ void app_main(void)
     }
 
     // 7. 启动GNSS任务
-    xTaskCreate(gnss_task, "gnss_task", 4096, NULL, 8, NULL);
+    // 栈 6144：任务内局部缓冲约 800B，加上 ESP_LOGI 的 vprintf 路径，4096 偏紧
+    xTaskCreate(gnss_task, "gnss_task", 6144, NULL, 8, NULL);
 
     // 8. 启动GPS+MQTT周期任务
     xTaskCreate(gps_mqtt_cycle_task, "gps_cycle", 4096, NULL, 9, NULL);

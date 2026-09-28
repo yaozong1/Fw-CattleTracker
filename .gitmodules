@@ -1,0 +1,6 @@
+[submodule "tools/factory_gui"]
+	path = tools/factory_gui
+	url = git@github.com:yaozong1/factory_gui.git
+[submodule "tools/test_jig_firmware"]
+	path = tools/test_jig_firmware
+	url = git@github.com:yaozong1/test_jig_firmware_S3.git

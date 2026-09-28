@@ -1,23 +1,33 @@
 #ifndef MQTT_CONFIG_H
 #define MQTT_CONFIG_H
 
-// MQTT服务器配置
-#define MQTT_BROKER_HOST    "processengineeringsz.com"      // MQTT服务器地址
-#define MQTT_BROKER_PORT    1883                        // MQTT服务器端口 (1883=非加密, 8883=SSL)
+/* ---------------- MQTT 服务器 ----------------
+ * 自建 broker（47.89.154.60）。
+ * 后端 Web 端走 ws://47.89.154.60:8083/mqtt（WebSocket），
+ * 但 EG800 的 AT+QMTOPEN 只能跑裸 TCP 上的原生 MQTT，握不了 WebSocket，
+ * 所以这里用同一台机器的 1883 端口，两边数据是通的。
+ *
+ * 直接写 IP 不写域名：原来的 processengineeringsz.com 已过期
+ * （现在解析到万网的 expired.hichina.com 停放页），而且省一次 DNS 解析。
+ * ⚠️ 改这个文件时注意别被旧的编辑器缓冲区覆盖回去。 */
+#define MQTT_BROKER_HOST    "47.89.154.60"
+#define MQTT_BROKER_PORT    1883                 // 1883=明文TCP(模组用这个), 8083=WebSocket(后端用), 8883=TLS
 
-// MQTT客户端认证信息
+// MQTT客户端认证信息（与后端 MY_PUBLIC_MQTT_USERNAME / PASSWORD 一致）
 #define MQTT_CLIENT_ID      "esp32_cattle_tracker_001"      // 客户端ID，确保唯一
 #define MQTT_USERNAME       "testuser"             // MQTT用户名
-#define MQTT_PASSWORD       "Hh3341136"             // MQTT密码
+#define MQTT_PASSWORD       "h3341136"             // MQTT密码
 
-// MQTT主题配置
-#define MQTT_TOPIC_PREFIX   "cattle/CT-001"                   // 主题前缀
-#define MQTT_TOPIC_STATUS   MQTT_TOPIC_PREFIX "/status" // 状态主题
-#define MQTT_TOPIC_DATA     MQTT_TOPIC_PREFIX "/data"   // 数据主题
-#define MQTT_TOPIC_GPS      MQTT_TOPIC_PREFIX "/gps"    // GPS位置主题
-#define MQTT_TOPIC_SENSOR   MQTT_TOPIC_PREFIX "/sensor" // 传感器数据主题
-#define MQTT_TOPIC_BATTERY  MQTT_TOPIC_PREFIX "/battery" // 电池数据主题
-#define MQTT_TOPIC_Device   MQTT_TOPIC_PREFIX "/device" // 传感器数据主题
+/* ---------------- MQTT 主题 ----------------
+ * fleet manager 订阅的是 fleet/+/battery，并且**从主题的第二段取设备 ID**
+ * （src/services/mqtt-service.ts: topicParts[1]）。
+ * 所以主题必须是 fleet/<deviceId>/battery，deviceId 在运行时由模组 IMEI 填入，
+ * 不能在这里写死 —— 见 mqtt_module.c 的 mqtt_build_topic()。
+ */
+#define MQTT_TOPIC_ROOT     "fleet"      // 主题根，需与后端订阅前缀一致
+#define MQTT_TOPIC_SUB_BATTERY "battery" // fleet/<id>/battery（后端已订阅）
+#define MQTT_TOPIC_SUB_STATUS  "status"  // fleet/<id>/status （后端已订阅，暂未使用）
+#define MQTT_TOPIC_SUB_GPS     "gps"     // fleet/<id>/gps    （后端**没有**订阅）
 
 // MQTT QoS等级
 // 建议当前阶段使用QoS0以简化发布流程（无需msgId确认，移动网络更稳）

@@ -74,6 +74,13 @@ bool lis2dh12_data_ready(void);
 bool lis2dh12_read_register(uint8_t reg_addr, uint8_t* data);
 bool lis2dh12_write_register(uint8_t reg_addr, uint8_t data);
 
+/* 进 deep sleep 之前必须调用。
+ * LIS2DH12 挂在 3V3_ALWAYS_ON 上，这条轨永远在线，MCU 睡了它还在采样。
+ * 高分辨率模式 Idd 典型 185 µA，折到电池侧约 360 µA —— 静态电流的大头。
+ * 写 CTRL_REG1 = 0x00 进 power-down 之后降到 0.5 µA。
+ * 同时停掉 motion_sensor_task 的轮询，避免它在断电后继续读寄存器。 */
+bool motion_sensor_power_down(void);
+
 // 实用函数
 float lis2dh12_calculate_magnitude(const lis2dh12_accel_data_t* data);
 void motion_sensor_test(void);

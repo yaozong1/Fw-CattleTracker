@@ -33,6 +33,12 @@ void fence_pins_safe_init(void);
 // LT3750 DONE# 为低电平表示充电完成
 bool fence_charge_done(void);
 
+/* ---- deep sleep 引脚保持 ----
+ * ESP32-S3 只有 IO0~IO21 是 RTC GPIO，深睡期间只有它们能靠 hold 维持电平，
+ * 其余引脚一律浮空。进 deep sleep 前调 prepare，醒来 gpio_init() 后调 release。 */
+void deep_sleep_prepare_pins(void);
+void deep_sleep_release_pins(void);
+
 // 电子围栏电源轨（12V_EN + 5V0_ISO_EN）。
 // 只开/关供电轨，CHARGE 与 TRIG 始终保持低电平，不会充电也不会放电。
 void fence_rails_enable(bool on);

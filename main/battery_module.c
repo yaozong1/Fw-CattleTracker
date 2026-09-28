@@ -57,13 +57,50 @@ float read_battery_voltage(void)
     return (float)mv / 1000.0f * VBAT_DIVIDER_RATIO;
 }
 
+/* 单节锂电池 OCV → SOC 查表（静置电压，室温）。
+ * 锂电放电平台很平，直接线性插值会在 3.7~3.9V 这段严重失真，
+ * 所以用分段表 + 线性插值。端点跟 hardware_config.h 的 VBAT_FULL_V /
+ * VBAT_EMPTY_V 对齐；换电芯的话改这张表即可。
+ * 注意：表针对空载电压，带载时电池会被拉低，读数应在模组上电前采样。 */
+typedef struct {
+    float v;
+    int   soc;
+} ocv_point_t;
+
+static const ocv_point_t s_ocv_table[] = {
+    { VBAT_FULL_V, 100 },   // 4.15
+    { 4.08f,        90 },
+    { 4.00f,        80 },
+    { 3.93f,        70 },
+    { 3.87f,        60 },
+    { 3.82f,        50 },
+    { 3.79f,        40 },
+    { 3.75f,        30 },
+    { 3.70f,        20 },
+    { 3.60f,        10 },
+    { 3.45f,         5 },
+    { VBAT_EMPTY_V,  0 },   // 3.30
+};
+
+#define OCV_TABLE_LEN ((int)(sizeof(s_ocv_table) / sizeof(s_ocv_table[0])))
+
 int estimate_soc_from_voltage(float v)
 {
-    // 单节锂电池（CN3163 充电），近似线性估算
-    if (v >= VBAT_FULL_V)  { return 100; }
-    if (v <= VBAT_EMPTY_V) { return 0; }
-    float soc = (v - VBAT_EMPTY_V) / (VBAT_FULL_V - VBAT_EMPTY_V) * 100.0f;
-    if (soc < 0)   { soc = 0; }
-    if (soc > 100) { soc = 100; }
-    return (int)(soc + 0.5f);
+    if (v >= s_ocv_table[0].v) { return 100; }
+    if (v <= s_ocv_table[OCV_TABLE_LEN - 1].v) { return 0; }
+
+    for (int i = 1; i < OCV_TABLE_LEN; ++i) {
+        if (v >= s_ocv_table[i].v) {
+            const ocv_point_t *hi = &s_ocv_table[i - 1];
+            const ocv_point_t *lo = &s_ocv_table[i];
+            float span = hi->v - lo->v;
+            if (span <= 0.0f) { return lo->soc; }
+            float k = (v - lo->v) / span;
+            float soc = (float)lo->soc + k * (float)(hi->soc - lo->soc);
+            if (soc < 0.0f)   { soc = 0.0f; }
+            if (soc > 100.0f) { soc = 100.0f; }
+            return (int)(soc + 0.5f);
+        }
+    }
+    return 0;
 }

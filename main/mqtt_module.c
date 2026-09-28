@@ -2,6 +2,9 @@
 #include "hardware_config.h"
 #include "mqtt_config.h"
 #include "gnss_module.h"
+#include "gpio_module.h"
+#include "battery_module.h"
+#include "motion_sensor.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -12,8 +15,27 @@
 #include "esp_adc_cal.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 
 static const char *TAG = "MQTT";
+
+/* 模组总线互斥：周期上报任务和手动上报任务都要独占 UART1 + 模组电源，
+ * 不加锁的话两边会同时发 AT，响应互相串味。mqtt_init() 里创建。 */
+static SemaphoreHandle_t s_modem_mutex = NULL;
+
+static bool modem_bus_lock(uint32_t timeout_ms)
+{
+    if (s_modem_mutex == NULL) { return true; }   // 尚未初始化，退化为不加锁
+    TickType_t t = (timeout_ms == portMAX_DELAY) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTake(s_modem_mutex, t) == pdTRUE;
+}
+
+static void modem_bus_unlock(void)
+{
+    if (s_modem_mutex != NULL) { xSemaphoreGive(s_modem_mutex); }
+}
 
 // 全局状态变量
 #if ENABLE_MQTT
@@ -28,6 +50,62 @@ static volatile bool uart_read_busy = false;
 
 // 外部依赖的ADC变量（需要从外部提供）
 extern esp_adc_cal_characteristics_t *adc_chars;
+
+/* ---------------- deviceId：绑定模组 IMEI ---------------- */
+// 取不到 IMEI 时的回退值，便于在云端一眼看出是没读到而不是设备重名
+static char s_device_id[24] = "CT-IMEI-UNKNOWN";
+static bool s_device_id_valid = false;
+
+const char* device_get_id(void)
+{
+    return s_device_id;
+}
+
+bool device_id_is_imei(void)
+{
+    return s_device_id_valid;
+}
+
+// 拼出 fleet/<deviceId>/<suffix>
+void mqtt_build_topic(char *out, size_t out_sz, const char *suffix)
+{
+    snprintf(out, out_sz, "%s/%s/%s", MQTT_TOPIC_ROOT, device_get_id(), suffix);
+}
+
+bool device_fetch_imei(void)
+{
+    if (s_device_id_valid) {
+        return true;   // 已经拿到过，不再重复问模组
+    }
+
+    send_at_command("AT+GSN");
+
+    char resp[128];
+    int len = uart_read_response(resp, sizeof(resp), 1000);
+    if (len > 0) {
+        char *p = resp;
+        while (*p) {
+            if (*p >= '0' && *p <= '9') {
+                int digits = 0;
+                char *start = p;
+                while (p[digits] >= '0' && p[digits] <= '9') digits++;
+                if (digits == 15) {          // IMEI 固定 15 位
+                    memcpy(s_device_id, start, 15);
+                    s_device_id[15] = '\0';
+                    s_device_id_valid = true;
+                    ESP_LOGI(TAG, "deviceId bound to IMEI: %s", s_device_id);
+                    return true;
+                }
+                p += digits;
+            } else {
+                p++;
+            }
+        }
+    }
+
+    ESP_LOGW(TAG, "Failed to read IMEI, deviceId stays '%s'", s_device_id);
+    return false;
+}
 
 // AT命令函数
 void send_at_command(const char* command)
@@ -198,7 +276,10 @@ bool mqtt_init_network(void)
     ESP_LOGI(TAG, "Step 2: Disabling echo...");
     send_at_command("ATE0");
     wait_for_ok(3000);
-    
+
+    // 2.1 读取 IMEI 作为 deviceId（只取一次，之后沿用缓存）
+    device_fetch_imei();
+
     // 3. 设置全功能模式
     ESP_LOGI(TAG, "Step 3: Setting full functionality mode...");
     send_at_command("AT+CFUN=1");
@@ -407,11 +488,12 @@ void mqtt_poll_urc(void)
 
 void modem_power_cycle(void)
 {
-    // Cattle_T: EG800。IO48(MODEM_EN) 低有效，先确保 3.8V 供电已打开；
-    // IO33(PWRKEY) 经 NPN 反相，置 1 相当于把 PWRKEY 拉低。
-    ESP_LOGI("MODEM", "Power-cycle EG800 via PWRKEY sequence");
-    gpio_set_level(MODEM_EN_PIN, 0);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    /* Cattle_T: EG800。3.8V 轨默认是关的（MODEM_RAIL_ON_AT_BOOT=0），
+     * 这里先开轨并等稳压建立，再打 PWRKEY 脉冲。
+     * IO33(PWRKEY) 经 Q8 反相，置 1 相当于把 PWRKEY 拉低。 */
+    ESP_LOGI("MODEM", "Power-cycle EG800: 先开 3.8V 轨，再走 PWRKEY 时序");
+    modem_power_enable(true);
+    vTaskDelay(MODEM_RAIL_SETTLE_MS / portTICK_PERIOD_MS);
     gpio_set_level(QT_POWER_PIN, 0);
     vTaskDelay(100 / portTICK_PERIOD_MS);
     gpio_set_level(QT_POWER_PIN, 1);
@@ -428,46 +510,52 @@ static void modem_power_off_soft(void)
 #endif
 }
 
+/* 彻底关掉模组：先让它自己正常注销关机（AT+QPOWD），再断 3.8V 轨。
+ *
+ * 为什么仍然要先 QPOWD，而不是直接断电：断电是硬掉电，模组来不及向网络注销，
+ * 基站侧还挂着这个上下文，下次入网要走完整流程、耗时更长；SIM 文件系统也有被
+ * 写坏的风险。所以正常路径永远是 QPOWD -> 等 POWERED DOWN -> 断轨。
+ *
+ * 改版硬件（MODEM_EN_ACTIVE_HIGH=1）之后断轨是真断：IO48 高有效直驱 U27 的 EN，
+ * 深睡期间 IO48 变高阻，板上的下拉把 EN 按在地上，3.8V 轨整个休眠期都是断的。
+ * 初版硬件是反的（EN 上拉到 5V0），浮空会让轨自己恢复通电，见 POWER_BUDGET.md。 */
+static void modem_power_down_full(void)
+{
 #if ENABLE_MQTT
-static float read_battery_voltage(void)
-{
-    uint32_t adc_reading = 0;
-    for (int i = 0; i < NO_OF_SAMPLES; i++) adc_reading += adc1_get_raw(ADC1_CHANNEL);
-    adc_reading /= NO_OF_SAMPLES;
-    uint32_t mv = esp_adc_cal_raw_to_voltage(adc_reading, adc_chars);
-    return (float)mv / 1000.0f * VBAT_DIVIDER_RATIO;
+    ESP_LOGI("MODEM", "Full power down: AT+QPOWD=1 ...");
+    send_at_command("AT+QPOWD=1");
+    // 模组会回 OK 然后输出 POWERED DOWN，给它时间正常注销
+    if (!wait_for_contains("POWERED DOWN", MODEM_QPOWD_TIMEOUT_MS)) {
+        ESP_LOGW("MODEM", "没等到 POWERED DOWN，退回 AT+CFUN=0");
+        modem_power_off_soft();
+    }
+#endif
+    modem_power_enable(false);   // 断 3.8V 轨
+    ESP_LOGI("MODEM", "Modem powered down, 3.8V rail disabled");
 }
 
-static int estimate_soc_from_voltage(float v)
+#if ENABLE_MQTT
+// 电压与 SOC 统一由 battery_module 提供，这里不再另起一份实现。
+
+// 唤醒模组之前采下的空载电压。模组入网/发射时电流冲击会把电池拉低，
+// 用那时的读数换算 SOC 会明显偏低，所以在上电前先记一笔。
+static float s_vbat_idle = 0.0f;
+
+void battery_snapshot_idle(void)
 {
-    // Cattle_T：单节锂电池（阈值见 hardware_config.h）
-    if (v >= VBAT_FULL_V)  { return 100; }
-    if (v <= VBAT_EMPTY_V) { return 0; }
-    float soc = (v - VBAT_EMPTY_V) / (VBAT_FULL_V - VBAT_EMPTY_V) * 100.0f;
-    if (soc < 0) {
-        soc = 0;
-    }
-    if (soc > 100) {
-        soc = 100;
-    }
-    return (int)(soc + 0.5f);
+    s_vbat_idle = read_battery_voltage();
+    ESP_LOGI("BAT", "Idle VBAT snapshot: %.2f V (SOC %d%%)",
+             s_vbat_idle, estimate_soc_from_voltage(s_vbat_idle));
 }
 
-bool publish_battery_payload(void)
+// 构造电池 JSON。放成独立函数是为了能在联网拿到 IMEI 之后再调用。
+static int build_battery_json(char *payload, size_t payload_sz)
 {
-    char payload[512];
-    float voltage = 4.2f;
-    static int current_soc = 96;
-    
-    // 每次交替 +1 / -1
-    static int toggle = 0;
-    int delta = toggle ? -1 : 1;
-    toggle ^= 1;
-    current_soc += delta;
-    if (current_soc < 0) current_soc = 0;
-    if (current_soc > 100) current_soc = 100;
-    int soc = current_soc;
-    
+    // 电压取板上 IO1 (IBL) 的实测值：ADC 读数 × 分压比 1.303。
+    // 优先用唤醒模组之前的空载快照，拿不到才现场读一次。
+    float voltage = (s_vbat_idle > 0.5f) ? s_vbat_idle : read_battery_voltage();
+    int soc = estimate_soc_from_voltage(voltage);
+
     float temperature = 31.4f;
     int health = 96;
     int cycleCount = 182;
@@ -482,30 +570,53 @@ bool publish_battery_payload(void)
     
     // 时间戳
     uint64_t ts_ms = (uint64_t)xTaskGetTickCount() * 1000 / configTICK_RATE_HZ;
-    
-    int n = snprintf(payload, sizeof(payload),
-    "{\n"
-    "  \"deviceId\": \"%s\",\n"
-    "  \"timestamp\": %llu,\n"
-    "  \"battery\": {\n"
-        "    \"soc\": %d,\n"
-        "    \"voltage\": %.2f,\n"
-        "    \"temperature\": %.1f,\n"
-        "    \"health\": %d,\n"
-        "    \"cycleCount\": %d,\n"
-        "    \"estimatedRange\": %.1f,\n"
-        "    \"chargingStatus\": \"%s\"\n"
-    "  },\n"
-        "  \"gps\": {\n"
-        "    \"lat\": %.6f,\n"
-        "    \"lng\": %.6f,\n"
-        "    \"speed\": %.1f,\n"
-        "    \"heading\": %d,\n"
-        "    \"altitude\": %.1f,\n"
-        "    \"accuracy\": %d\n"
-    "  }\n"
+
+    /* 没有有效定位时整段省掉 gps 字段，而不是发 0,0。
+     * 后端对 gps 缺失是容忍的（telemetryData.gps = undefined，日志打 "GPS: none"），
+     * 但 0,0 会在地图上画出一个几内亚湾的假点。 */
+    char gps_part[192];
+    if (gnss_last_location.valid) {
+        snprintf(gps_part, sizeof(gps_part),
+            ",\"gps\":{"
+                "\"lat\":%.6f,"
+                "\"lng\":%.6f,"
+                "\"speed\":%.1f,"
+                "\"heading\":%d,"
+                "\"altitude\":%.1f,"
+                "\"accuracy\":%d"
+            "}",
+            gnss_last_location.lat_deg,
+            gnss_last_location.lon_deg,
+            speed_kmh,
+            heading,
+            altitude,
+            accuracy);
+    } else {
+        gps_part[0] = '\0';
+    }
+
+    /* fleet manager 读的是**顶层**字段（src/services/mqtt-service.ts:
+     * handleBatteryMessage → data.soc / data.voltage / data.temperature /
+     * data.health / data.cycleCount / data.estimatedRangeKm /
+     * data.chargingStatus / data.alerts / data.gps.*）。
+     * 所以电池各项不能再包在 "battery": {} 里，且字段名是 estimatedRangeKm。
+     * deviceId 与 timestamp 后端并不读取（设备身份取自主题、时间戳用服务器本地时间），
+     * 这里保留只是为了排查时方便对照。 */
+    int n = snprintf(payload, payload_sz,
+    "{"
+        "\"deviceId\":\"%s\","
+        "\"timestamp\":%llu,"
+        "\"soc\":%d,"
+        "\"voltage\":%.2f,"
+        "\"temperature\":%.1f,"
+        "\"health\":%d,"
+        "\"cycleCount\":%d,"
+        "\"estimatedRangeKm\":%.1f,"
+        "\"chargingStatus\":\"%s\","
+        "\"alerts\":[]"
+        "%s"
     "}",
-    "CT-001",
+        device_get_id(),
         ts_ms,
         soc,
         voltage,
@@ -514,23 +625,31 @@ bool publish_battery_payload(void)
         cycleCount,
         estimatedRangeKm,
         chargingStatus,
-        gnss_last_location.lat_deg,
-        gnss_last_location.lon_deg,
-        speed_kmh,
-        heading,
-        altitude,
-        accuracy);
-    if (n <= 0 || n >= (int)sizeof(payload)) {
-        ESP_LOGE("BAT", "Battery JSON build failed");
-        return false;
-    }
+        gps_part);
+    return n;
+}
+
+bool publish_battery_payload(void)
+{
+    char payload[512];
+    char topic[80];
 
     for (int attempt = 1; attempt <= MQTT_SEND_MAX_RETRY; ++attempt) {
         ESP_LOGI("BAT", "MQTT publish attempt %d/%d", attempt, MQTT_SEND_MAX_RETRY);
         if (!mqtt_init_network()) continue;
         if (!mqtt_connect_broker()) continue;
-        ESP_LOGI("BAT", "Topic: %s\nPayload:\n%s", MQTT_TOPIC_BATTERY, payload);
-        bool ok = mqtt_publish_message(MQTT_TOPIC_BATTERY, payload);
+
+        // IMEI 是在 mqtt_init_network() 里读到的，主题和 payload 都要等它就位
+        mqtt_build_topic(topic, sizeof(topic), MQTT_TOPIC_SUB_BATTERY);
+        int n = build_battery_json(payload, sizeof(payload));
+        if (n <= 0 || n >= (int)sizeof(payload)) {
+            ESP_LOGE("BAT", "Battery JSON build failed");
+            mqtt_disconnect_broker();
+            return false;
+        }
+
+        ESP_LOGI("BAT", "Topic: %s\nPayload:\n%s", topic, payload);
+        bool ok = mqtt_publish_message(topic, payload);
         mqtt_disconnect_broker();
         if (ok) return true;
         vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -538,9 +657,11 @@ bool publish_battery_payload(void)
     return false;
 }
 
+// 注意：fleet manager 只订阅 fleet/+/battery、fleet/+/status、fleet/chargenode/+，
+// 没有订阅 fleet/+/gps。GPS 数据是随 battery payload 的 "gps" 字段一起上去的，
+// 本函数目前没有调用点，保留备用。
 bool publish_gps_payload(void)
 {
-    // GPS数据已经包含在battery payload中，这里可以单独发送GPS数据
     if (!gnss_last_location.valid) {
         ESP_LOGW("GPS", "No valid GPS location to publish");
         return false;
@@ -553,7 +674,7 @@ bool publish_gps_payload(void)
     
     int n = snprintf(payload, sizeof(payload),
     "{\n"
-    "  \"deviceId\": \"CT-001\",\n"
+    "  \"deviceId\": \"%s\",\n"
     "  \"timestamp\": %llu,\n"
     "  \"lat\": %.6f,\n"
     "  \"lng\": %.6f,\n"
@@ -562,6 +683,7 @@ bool publish_gps_payload(void)
     "  \"altitude\": 156.0,\n"
     "  \"accuracy\": 5\n"
     "}",
+        device_get_id(),
         ts_ms,
         gnss_last_location.lat_deg,
         gnss_last_location.lon_deg,
@@ -573,19 +695,144 @@ bool publish_gps_payload(void)
         return false;
     }
 
+    char topic[80];
+
     for (int attempt = 1; attempt <= MQTT_SEND_MAX_RETRY; ++attempt) {
         ESP_LOGI("GPS", "MQTT publish attempt %d/%d", attempt, MQTT_SEND_MAX_RETRY);
         if (!mqtt_init_network()) continue;
         if (!mqtt_connect_broker()) continue;
-        ESP_LOGI("GPS", "Topic: %s\nPayload:\n%s", MQTT_TOPIC_GPS, payload);
-        bool ok = mqtt_publish_message(MQTT_TOPIC_GPS, payload);
+        mqtt_build_topic(topic, sizeof(topic), MQTT_TOPIC_SUB_GPS);
+        ESP_LOGI("GPS", "Topic: %s\nPayload:\n%s", topic, payload);
+        bool ok = mqtt_publish_message(topic, payload);
         mqtt_disconnect_broker();
         if (ok) return true;
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
     return false;
 }
+
+/* ================= 手动上报（IO0 双击触发） =================
+ * 不管有没有 GNSS 定位都发一条。跑在独立的一次性任务里，原因有两个：
+ *   1) 整个流程最长可能几分钟，不能占着按键任务不放；
+ *   2) MQTT 那一串函数的局部缓冲区加起来要 2.5KB 以上，按键任务的栈不够。
+ */
+static volatile bool s_manual_pub_running = false;
+
+static void manual_publish_task(void *pv)
+{
+    (void)pv;
+    bool powered_here = false;
+
+    // 不等待：周期任务正在用模组的话，这次手动请求直接放弃，避免两个任务抢 UART1
+    if (!modem_bus_lock(0)) {
+        ESP_LOGW("PUB", "Cycle task is using the modem, manual publish skipped");
+        led_blink(LED_CONN_PIN, 1, 800, 200);
+        s_manual_pub_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI("PUB", "===== Manual publish (IO0 double-click) =====");
+    ESP_LOGI("PUB", "GNSS fix: %s", gnss_last_location.valid ? "valid" : "none (gps field omitted)");
+
+    // 模组上电前先采空载电压
+    battery_snapshot_idle();
+
+    led_blink(LED_CONN_PIN, GPS_UPLOAD_BLINK_TIMES,
+              GPS_UPLOAD_BLINK_ON_MS, GPS_UPLOAD_BLINK_OFF_MS);
+
+    if (!modem_is_powered()) {
+        ESP_LOGI("PUB", "Modem is off, powering up...");
+        modem_power_cycle();
+        powered_here = true;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    bool ok = publish_battery_payload();
+    ESP_LOGI("PUB", "Manual publish %s", ok ? "SUCCESS" : "FAILED");
+
+    // 结果指示：成功闪 3 下，失败长亮一下
+    if (ok) {
+        led_blink(LED_CONN_PIN, 3, 120, 120);
+    } else {
+        led_blink(LED_CONN_PIN, 1, 1000, 200);
+    }
+
+    // 只关我们自己开起来的模组，避免打断周期任务的状态
+    if (powered_here) {
+        modem_power_off_soft();
+    }
+
+    modem_bus_unlock();
+    s_manual_pub_running = false;
+    vTaskDelete(NULL);
+}
+
+void mqtt_manual_publish_request(void)
+{
+    if (s_manual_pub_running) {
+        ESP_LOGW("PUB", "Manual publish already in progress, ignoring");
+        return;
+    }
+    s_manual_pub_running = true;
+    if (xTaskCreate(manual_publish_task, "manual_pub", 6144, NULL, 7, NULL) != pdPASS) {
+        s_manual_pub_running = false;
+        ESP_LOGE("PUB", "Failed to create manual publish task");
+    }
+}
+#else  // !ENABLE_MQTT
+void mqtt_manual_publish_request(void)
+{
+    ESP_LOGW("PUB", "Manual publish ignored: ENABLE_MQTT=0");
+}
 #endif // ENABLE_MQTT
+
+#if ENABLE_DEEP_SLEEP
+/* 进入 deep sleep。不返回：醒来等同于复位，从 app_main 重新跑一遍。
+ * 跨睡眠不保留任何 RAM 状态——IMEI 每轮重读一次（模组本来就要重启），
+ * APN 同理，成本可以忽略。 */
+static void enter_deep_sleep_cycle(uint32_t seconds)
+{
+    ESP_LOGI("SLEEP", "ESP32 deep sleep %lu 秒，醒来后从 app_main 重新开始",
+             (unsigned long)seconds);
+
+    /* 加速度计挂在 3V3_ALWAYS_ON 上，MCU 睡了它不会跟着睡。
+     * 必须显式写 power-down，否则高分辨率 100 Hz 会一直吃 ~185 µA
+     * （电池侧约 360 µA，比整机其余底噪加起来还多）。 */
+    motion_sensor_power_down();
+
+    // 锁住 RTC GPIO 的电平（GNSS 供电必须保持，围栏引脚必须保持低）
+    deep_sleep_prepare_pins();
+
+    esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+
+#if DEEPSLEEP_WAKE_ON_BUTTON
+    /* IO0 低电平唤醒。
+     * 坑：IO0 的高电平只靠 gpio_init() 里的内部上拉，板上没有外部上拉电阻
+     * （原理图 IO0 只接 SW2 到地 + 测试点 TP6）。进 deep sleep 后数字域的上拉
+     * 会被关闭，引脚浮空 -> 读成低 -> ext0 立刻触发 -> 刚睡下就醒，死循环。
+     * 所以必须显式打开 RTC 域的上拉，并关掉下拉。 */
+    rtc_gpio_pullup_en((gpio_num_t)BUTTON_PIN);
+    rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_PIN);
+
+    int io0 = gpio_get_level(BUTTON_PIN);
+    if (io0 == 0) {
+        // 按键卡住或被按着，此时挂 ext0 必然立刻唤醒，干脆不挂
+        ESP_LOGW("SLEEP", "IO%d 当前为低，跳过按键唤醒源（否则会立刻被唤醒）", BUTTON_PIN);
+        ESP_LOGI("SLEEP", "唤醒源：仅定时器 %lu 秒", (unsigned long)seconds);
+    } else {
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+        ESP_LOGI("SLEEP", "唤醒源：定时器 %lu 秒 + IO%d 按键（RTC 上拉已开，当前电平=%d）",
+                 (unsigned long)seconds, BUTTON_PIN, io0);
+    }
+#else
+    ESP_LOGI("SLEEP", "唤醒源：定时器 %lu 秒", (unsigned long)seconds);
+#endif
+
+    vTaskDelay(pdMS_TO_TICKS(100));   // 让日志吐完
+    esp_deep_sleep_start();
+}
+#endif // ENABLE_DEEP_SLEEP
 
 void gps_mqtt_cycle_task(void* pv)
 {
@@ -593,10 +840,19 @@ void gps_mqtt_cycle_task(void* pv)
              GPS_CYCLE_SLEEP_MIN, GPS_FIX_TIMEOUT_SEC, MQTT_SEND_MAX_RETRY);
 
     while (1) {
-        // 1) 仅启动 GNSS，先尝试拿定位
+        // 1) 启动 GNSS。若本次是从 deep sleep 醒来，模组还在 Backup 里，
+        //    必须用 RESET_N 脉冲叫醒它（Backup 只能硬件复位唤醒）。
         bool powered_modem = false;
         gnss_enable(true);
         gnss_reset_release();
+
+#if ENABLE_DEEP_SLEEP
+        esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+        if (wc == ESP_SLEEP_WAKEUP_TIMER || wc == ESP_SLEEP_WAKEUP_EXT0) {
+            ESP_LOGI("GPS", "从 deep sleep 醒来，先把 GNSS 从 Backup 唤醒");
+            gnss_wake_from_standby2();
+        }
+#endif
 
         // 2) 连续模式下等待 GNSS 定位
         gnss_last_location.valid = false;
@@ -608,9 +864,38 @@ void gps_mqtt_cycle_task(void* pv)
             vTaskDelay(200 / portTICK_PERIOD_MS);
         }
 
+        // 2.1) 定位成功：在串口打一段完整的定位信息
+        if (gnss_last_location.valid) {
+            uint32_t ttff_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+            ESP_LOGI("GPS", "================ GNSS FIX ACQUIRED ================");
+            ESP_LOGI("GPS", "  UTC       : %s", gnss_last_location.time_utc);
+            ESP_LOGI("GPS", "  Latitude  : %.6f deg", gnss_last_location.lat_deg);
+            ESP_LOGI("GPS", "  Longitude : %.6f deg", gnss_last_location.lon_deg);
+            ESP_LOGI("GPS", "  Speed     : %.2f kn (%.1f km/h)",
+                     gnss_last_location.spd_kn, gnss_last_location.spd_kn * 1.852);
+            ESP_LOGI("GPS", "  Course    : %.1f deg", gnss_last_location.crs_deg);
+            ESP_LOGI("GPS", "  Satellites: %d, HDOP %.1f, fixQ %d, dim %dD",
+                     gnss_sats, gnss_hdop, gnss_fix_q, gnss_dim);
+            ESP_LOGI("GPS", "  Time to fix: %lu ms", (unsigned long)ttff_ms);
+            ESP_LOGI("GPS", "===================================================");
+#if ENABLE_DEEP_SLEEP
+            app_note_fix_ok();
+#endif
+        }
+
         // 3) 若拿到定位，则唤醒 EG800 并进行 MQTT
 #if ENABLE_MQTT
         if (gnss_last_location.valid) {
+            // 独占模组总线，手动上报任务此时会主动让路
+            modem_bus_lock(portMAX_DELAY);
+
+            // 模组还没上电，此刻是空载，先把电池电压记下来
+            battery_snapshot_idle();
+
+            // 上报前闪一下 CONN_LED，指示"准备上云"
+            led_blink(LED_CONN_PIN, GPS_UPLOAD_BLINK_TIMES,
+                      GPS_UPLOAD_BLINK_ON_MS, GPS_UPLOAD_BLINK_OFF_MS);
+
             ESP_LOGI("GPS", "GNSS fix acquired, bringing up EG800 for MQTT publish");
             ESP_LOGI("MODEM", "Wake EG800: about to PWRKEY pulse (power-cycle) to publish");
             modem_power_cycle();
@@ -619,31 +904,50 @@ void gps_mqtt_cycle_task(void* pv)
 
             bool pub_ok = publish_battery_payload();
             ESP_LOGI("BAT", "Publish %s", pub_ok ? "success" : "failed");
+#if ENABLE_DEEP_SLEEP
+            if (pub_ok) { app_note_publish_ok(); }
+#endif
+            // 注意：锁要持有到第 4 步关掉模组之后再放
         } else {
             ESP_LOGW("GPS", "No GNSS fix within %ds, skip EG800/MQTT and go to sleep", GPS_FIX_TIMEOUT_SEC);
         }
 #endif
 
-        // 4) 进入省电
-        ESP_LOGI("GPS", "Enter sleep: GNSS standby + modem CFUN=0 for %d min", GPS_CYCLE_SLEEP_MIN);
+        /* 4) 进入省电（方案 E）
+         *    GNSS -> Backup（VCC 保持，星历留存，热启动）
+         *    模组 -> QPOWD 正常关机 + 断 3.8V 轨
+         *    ESP32 -> deep sleep                                      */
+        ESP_LOGI("GPS", "===== 进入省电：GNSS Backup + 模组关机 + ESP deep sleep %d 分钟 =====",
+                 GPS_CYCLE_SLEEP_MIN);
+
         gnss_enter_standby2();
+
         if (powered_modem) {
-            modem_power_off_soft();
+            modem_power_down_full();
+            modem_bus_unlock();   // 与第 3 步的 lock 配对，关完模组才放锁
         } else {
-            ESP_LOGI("MODEM", "Skip modem CFUN=0: modem wasn't powered this cycle");
+            ESP_LOGI("MODEM", "本轮没开过模组，只确保 3.8V 轨是关的");
+            modem_power_enable(false);
         }
 
-        // 进入睡眠间隔
+#if ENABLE_DEEP_SLEEP
+        enter_deep_sleep_cycle(GPS_CYCLE_SLEEP_MIN * 60U);
+        // enter_deep_sleep_cycle() 不返回，醒来是复位、从 app_main 重新开始
+#else
+        // 不用 deep sleep 时退回原来的行为：任务级延时 + 唤醒 GNSS
         vTaskDelay(GPS_CYCLE_SLEEP_MIN * 60 * 1000 / portTICK_PERIOD_MS);
-
-        // 5) 从 Standby 唤醒 GNSS
-        ESP_LOGI("GNSS_LP", "Wake GNSS: about to exit Standby (TX 0xFF + CRLF)");
+        ESP_LOGI("GNSS_LP", "Wake GNSS from backup");
         gnss_wake_from_standby2();
+#endif
     }
 }
 
 void mqtt_init(void)
 {
+    if (s_modem_mutex == NULL) {
+        s_modem_mutex = xSemaphoreCreateMutex();
+    }
+
     // 初始化 UART1 (普通轮询模式)
     uart_config_t uart_config = {
         .baud_rate = 115200,

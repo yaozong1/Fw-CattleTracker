@@ -1,6 +1,7 @@
 #include "button_module.h"
 #include "hardware_config.h"
 #include "gpio_module.h"
+#include "mqtt_module.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -37,11 +38,11 @@ static bool wait_level(bool want_down, uint32_t timeout_ms, uint32_t *elapsed_ms
     return false;
 }
 
+// 围栏动作：打开两路供电轨，再对 Trig 发方波（自测模式专用）
 void button_trigger_fence_rails_on(void)
 {
     fence_rails_enable(true);
-    ESP_LOGI(TAG, "Double-click: 5V0_ISO_EN + 12V_EN driven HIGH (charge stays LOW)");
-    led_blink(LED_ESP_PIN, BUTTON_ACK_BLINK_TIMES, BUTTON_ACK_BLINK_ON_MS, BUTTON_ACK_BLINK_OFF_MS);
+    ESP_LOGI(TAG, "Fence rails ON: 5V0_ISO_EN + 12V_EN HIGH (charge stays LOW)");
 
 #if FENCE_TRIG_TEST_AFTER_DBLCLICK
     // 等供电轨建立，再对 Trig 发方波，验证 PC817 + 可控硅驱动电路
@@ -52,10 +53,36 @@ void button_trigger_fence_rails_on(void)
 #endif
 }
 
+/* 双击的动作分发。两种模式互补，不会同时发生：
+ *   SELFTEST=1 → 打开围栏供电轨 + Trig 方波（可控硅测试）
+ *   SELFTEST=0 → 手动向 MQTT 发一条 payload，完全不碰可控硅
+ * 两种模式都先闪一下 ESP_LED 表示手势已识别。 */
+static void button_on_double_click(void)
+{
+    led_blink(LED_ESP_PIN, BUTTON_ACK_BLINK_TIMES, BUTTON_ACK_BLINK_ON_MS, BUTTON_ACK_BLINK_OFF_MS);
+
+#if BUTTON_DBLCLICK_FENCE_TEST
+    ESP_LOGI(TAG, "Double-click -> fence / SCR test");
+    button_trigger_fence_rails_on();
+#endif
+
+#if BUTTON_DBLCLICK_MQTT_PUBLISH
+    // 手动上报：不管有没有定位都发一条。立即返回，实际工作在 manual_pub 任务里。
+    ESP_LOGI(TAG, "Double-click -> manual MQTT publish");
+    mqtt_manual_publish_request();
+#endif
+}
+
 static void button_task(void *pv)
 {
     (void)pv;
-    ESP_LOGI(TAG, "Button task started on IO%d (double-click -> fence rails ON)", BUTTON_PIN);
+#if BUTTON_DBLCLICK_FENCE_TEST
+    ESP_LOGI(TAG, "Button task started on IO%d (double-click -> fence / SCR test)", BUTTON_PIN);
+#elif BUTTON_DBLCLICK_MQTT_PUBLISH
+    ESP_LOGI(TAG, "Button task started on IO%d (double-click -> manual MQTT publish)", BUTTON_PIN);
+#else
+    ESP_LOGI(TAG, "Button task started on IO%d (double-click -> no action configured)", BUTTON_PIN);
+#endif
 
     while (1) {
         // --- 等待第一次按下 ---
@@ -98,7 +125,7 @@ static void button_task(void *pv)
         }
 
         // 双击成立
-        button_trigger_fence_rails_on();
+        button_on_double_click();
 
         // 等第二次按键松开，防止连击被拆成新的一轮
         while (btn_down()) {

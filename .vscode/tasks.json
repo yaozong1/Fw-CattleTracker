@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build PE Board",
+			"type": "shell",
+			"command": "C:\\Users\\h1576\\.espressif\\python_env\\idf5.0_py3.11_env\\Scripts\\python.exe",
+			"args": [
+				"C:\\Users\\h1576\\esp\\esp-idf\\tools\\idf.py",
+				"build"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

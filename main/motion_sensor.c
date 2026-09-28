@@ -367,14 +367,39 @@ bool motion_sensor_init(void)
     return true;
 }
 
+/* 置位后 motion_sensor_task 自行退出，不再碰 I2C。
+ * 深睡唤醒等同复位，任务会重新创建，所以不需要再清回去。 */
+static volatile bool s_motion_stop = false;
+
+bool motion_sensor_power_down(void)
+{
+    s_motion_stop = true;
+    // 给轮询任务一个周期退出，避免和这里的写操作撞在同一条 I2C 总线上
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    // CTRL_REG1 = 0x00：ODR = power-down，XYZ 全关
+    bool ok = lis2dh12_write_register(LIS2DH12_CTRL_REG1, LIS2DH12_ODR_POWER_DOWN);
+    if (ok) {
+        ESP_LOGI(TAG, "LIS2DH12 -> power-down (CTRL_REG1=0x00)，Idd 185 µA -> 0.5 µA");
+    } else {
+        ESP_LOGW(TAG, "LIS2DH12 power-down 写寄存器失败，深睡期间它仍在采样");
+    }
+    return ok;
+}
+
 void motion_sensor_task(void* pvParameters)
 {
     ESP_LOGI(TAG, "Motion sensor task started");
-    
+
     // 等待传感器稳定
     vTaskDelay(1000 / portTICK_PERIOD_MS);
-    
+
     while (1) {
+        if (s_motion_stop) {
+            ESP_LOGI(TAG, "Motion sensor task stopping (deep sleep)");
+            vTaskDelete(NULL);
+            return;
+        }
         if (lis2dh12_data_ready()) {
             lis2dh12_accel_data_t accel_data;
             if (lis2dh12_read_accel_data(&accel_data)) {

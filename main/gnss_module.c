@@ -44,6 +44,15 @@ static volatile bool gnss_in_standby = false;
 static volatile bool gnss_ack_cfg_sleep = false;
 static volatile bool gnss_nak_cfg_sleep = false;
 
+/* Quectel 二进制协议 ACK（帧头 F1 D9，和 u-blox 的 B5 62 不是一回事）
+ * ACK-ACK = 组 0x05 子 0x01，载荷 {被确认的组 ID, 子 ID}
+ * ACK-NAK = 组 0x05 子 0x00，载荷同上
+ * 见 LC26xZ/LC76xZ GNSS 协议规范 3.3 节 */
+static volatile int  gnss_qack_group  = -1;
+static volatile int  gnss_qack_sub    = -1;
+static volatile bool gnss_qack_is_ack = false;
+static volatile bool gnss_qack_seen   = false;
+
 // 基准测试结束后，停止 GNSS 接收
 volatile bool gnss_should_stop = false;
 
@@ -162,6 +171,58 @@ void gnss_send_nmea(const char* sentence)
     uart_write_bytes(GNSS_UART_NUM, "\r\n", 2);
 }
 
+/* ===================== Quectel PAIR 协议 =====================
+ * LC760Z 属于 LC76G 系列（Airoha 平台），低功耗用的是 $PAIR NMEA 命令，
+ * 不是 u-blox 的 UBX 二进制。本文件早期那套 gnss_send_quectel_bin(0x06,0x41)
+ * 是从别的模组带过来的，这颗模组不认，已停用。
+ *
+ *   $PAIR003        关 GNSS 子系统，CPU 进 Standby
+ *   $PAIR002        从 PAIR003 恢复
+ *   $PAIR650,<秒>   进 Backup/RTC 模式，13 µA @3.3V，星历保留，热启动 1 s
+ *                   参数 0 = 一直睡，靠 RESET_N 唤醒
+ *   $PAIR001,<cmd>,<result>   模组对以上命令的 ACK，result 0 = OK
+ * ============================================================ */
+
+// $PAIR001 ACK 捕获（由 gnss_task 的行解析写入）
+static volatile int  gnss_pair_ack_cmd    = -1;
+static volatile int  gnss_pair_ack_result = -1;
+static volatile bool gnss_pair_ack_seen   = false;
+
+/* 专有语句（$P 开头）捕获。协议探测时用来接收任意厂商的回应，
+ * 不需要预先知道 ACK 的确切格式。 */
+static volatile uint32_t gnss_prop_count = 0;
+static char              gnss_last_prop[96];
+// 见过哪些专有前缀
+static volatile bool gnss_seen_pmtk = false;
+static volatile bool gnss_seen_pair = false;
+static volatile bool gnss_seen_pcas = false;
+static volatile bool gnss_seen_pq   = false;
+// 见过哪些 talker ID（$GN/$GP/$GL/$GA/$BD...）
+static char gnss_talkers[8][3];
+static volatile int gnss_talker_n = 0;
+
+// NMEA 校验和：'$' 与 '*' 之间所有字符的异或
+static uint8_t nmea_checksum(const char* body)
+{
+    uint8_t cs = 0;
+    for (const char* p = body; *p; ++p) { cs = (uint8_t)(cs ^ (uint8_t)(*p)); }
+    return cs;
+}
+
+// 发送 $<body>*<CS>\r\n，body 不含 '$'、'*' 和校验和（对外版本，供协议探测使用）
+void gnss_send_nmea_cs(const char* body)
+{
+    char out[96];
+    int n = snprintf(out, sizeof(out), "$%s*%02X\r\n", body, nmea_checksum(body));
+    if (n <= 0 || n >= (int)sizeof(out)) {
+        ESP_LOGE(TAG, "NMEA command too long: %s", body);
+        return;
+    }
+    uart_write_bytes(GNSS_UART_NUM, out, (size_t)n);
+}
+
+
+
 // 发送 UBX 二进制消息（B5 62 + cls + id + len + payload + CK_A CK_B）
 void gnss_send_ubx(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len)
 {
@@ -261,49 +322,349 @@ bool gnss_wait_for_activity2(uint32_t timeout_ms)
     return false;
 }
 
-// 使用 Quectel CFG-SLEEP 进入 Standby（mode=1），sleep_ms 指定待机时间
-static bool gnss_enter_standby_quectel(uint32_t sleep_ms)
+/* ---- 方案 E：VCC 保持供电，模组进 Backup（13 µA），靠 RESET_N 唤醒热启动 ----
+ * 保持 U21 (LP5907) 使能不变，所以 VCC 和 V_BCKP 都还在，星历不丢。
+ * 相比彻底断电（冷启动 ~28 s @36 mA），13 µA 的代价远小于省下的搜星时间。 */
+
+/* 兜底默认值：万一 hardware_config.h 没同步到，这里也能编过。
+ * CFG-SLEEP 执行后模组立刻休眠，本来就发不出 ACK（同手册里 CFG-SIMPLERST
+ * 的软件复位"系统命令，无 ACK"），所以等一小会儿就够。 */
+#ifndef GNSS_SLEEP_ACK_TIMEOUT_MS
+#define GNSS_SLEEP_ACK_TIMEOUT_MS 500
+#endif
+#ifndef GNSS_QBIN_ACK_TIMEOUT_MS
+#define GNSS_QBIN_ACK_TIMEOUT_MS 1500
+#endif
+#ifndef GNSS_WAKE_TIMEOUT_MS
+#define GNSS_WAKE_TIMEOUT_MS 5000
+#endif
+#ifndef GNSS_LP_USE_BACKUP
+#define GNSS_LP_USE_BACKUP 1
+#endif
+#ifndef GNSS_BACKUP_SLEEP_SEC
+#define GNSS_BACKUP_SLEEP_SEC 0
+#endif
+
+// 等待 Quectel 二进制 ACK-ACK（组/子 ID 匹配）
+static bool gnss_wait_quectel_ack(uint8_t group, uint8_t sub, uint32_t timeout_ms)
 {
-    ESP_LOGI(TAG, "Send Quectel CFG-SLEEP Standby: sleep_ms=%u, mode=1", (unsigned)sleep_ms);
-    gnss_send_cfg_sleep_quectel(sleep_ms, 1); // 1=Standby
-    // 要求 ≥1.5s 静默并在随后的 1s 内保持静默
-    if (gnss_wait_for_quiet2(1500, 5000)) {
-        uint32_t lines_before = gnss_lines_seen;
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        if (gnss_lines_seen == lines_before) {
-            ESP_LOGI(TAG, "Standby entered (UART quiet and stays quiet)");
-            return true;
+    TickType_t t0 = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        if (gnss_qack_seen && gnss_qack_group == group && gnss_qack_sub == sub) {
+            uint32_t ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+            if (gnss_qack_is_ack) {
+                ESP_LOGI(TAG, "[QBIN] ACK for %02X/%02X in %lu ms", group, sub, (unsigned long)ms);
+                return true;
+            }
+            ESP_LOGW(TAG, "[QBIN] NAK for %02X/%02X in %lu ms", group, sub, (unsigned long)ms);
+            return false;
         }
-        ESP_LOGW(TAG, "Quiet detected but activity resumed -> not standby");
-    } else {
-        ESP_LOGW(TAG, "No quiet after Standby CFG-SLEEP within timeout");
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
+    ESP_LOGW(TAG, "[QBIN] no ACK for %02X/%02X within %lu ms",
+             group, sub, (unsigned long)timeout_ms);
     return false;
+}
+
+// 发送 CFG-SLEEP (0x06 0x41)：载荷 = uint32 休眠毫秒(0=一直睡) + uint8 模式(1=Standby,3=Backup)
+static void gnss_send_cfg_sleep(uint32_t sleep_ms, uint8_t mode)
+{
+    uint8_t p[5];
+    p[0] = (uint8_t)(sleep_ms & 0xFF);
+    p[1] = (uint8_t)((sleep_ms >> 8) & 0xFF);
+    p[2] = (uint8_t)((sleep_ms >> 16) & 0xFF);
+    p[3] = (uint8_t)((sleep_ms >> 24) & 0xFF);
+    p[4] = mode;
+    gnss_qack_seen = false;
+    gnss_qack_group = gnss_qack_sub = -1;
+    gnss_ack_cfg_sleep = false;
+    gnss_nak_cfg_sleep = false;
+    ESP_LOGI(TAG, "[QBIN] TX -> CFG-SLEEP (06/41) sleep_ms=%lu mode=%u (%s)",
+             (unsigned long)sleep_ms, mode,
+             (mode == 3) ? "Backup" : (mode == 1) ? "Standby" : "?");
+    gnss_send_quectel_bin(0x06, 0x41, p, sizeof(p));
+}
+
+// 使能星历自动存 Flash（CFG-EPHSAVE 0x06 0x10），让 Backup 唤醒后能热启动
+bool gnss_enable_ephemeris_save(void)
+{
+    uint8_t p[1] = { 1 };
+    gnss_qack_seen = false;
+    ESP_LOGI(TAG, "[QBIN] TX -> CFG-EPHSAVE (06/10) enable=1");
+    gnss_send_quectel_bin(0x06, 0x10, p, sizeof(p));
+    return gnss_wait_quectel_ack(0x06, 0x10, GNSS_QBIN_ACK_TIMEOUT_MS);
 }
 
 bool gnss_enter_standby2(void)
 {
-    // 改为使用 Quectel CFG-SLEEP 的 Standby 模式（mode=1）
     gnss_in_standby = false;
-    bool ok = gnss_enter_standby_quectel(GNSS_LP_OFF_SEC * 1000U);
-    if (ok) gnss_in_standby = true;
-    return ok;
+
+    const uint8_t mode = GNSS_LP_USE_BACKUP ? 3 : 1;
+    ESP_LOGI(TAG, "===== GNSS low-power: entering %s =====",
+             GNSS_LP_USE_BACKUP ? "BACKUP (CFG-SLEEP mode=3)" : "STANDBY (CFG-SLEEP mode=1)");
+    ESP_LOGI(TAG, "  VCC stays ON (IO%d unchanged) so ephemeris/RTC survive", GNSS_EN_PIN);
+
+    /* 判据说明：
+     * CFG-SLEEP 执行后模组立刻睡过去，**发不出 ACK**——和手册里 CFG-SIMPLERST
+     * 的软件复位一样是"系统命令，无 ACK"。所以不能拿 ACK 当必要条件。
+     * 真正可靠的判据是**状态转变**：发命令前模组在持续输出，发完彻底停下。
+     * 这样既能确认命令生效，又能和"模组本来就不说话"的假阳性区分开。 */
+
+    // 1) 先量一下发命令之前的输出速率
+    uint32_t pre0 = gnss_lines_seen;
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint32_t rate_before = gnss_lines_seen - pre0;
+    ESP_LOGI(TAG, "  发送前输出速率  : %lu 句/秒", (unsigned long)rate_before);
+
+    uint32_t lines_before = gnss_lines_seen;
+    TickType_t t0 = xTaskGetTickCount();
+
+    // 2) 发命令。ACK 等一小会儿即可，收不到是预期行为
+    gnss_send_cfg_sleep(GNSS_BACKUP_SLEEP_SEC * 1000U, mode);
+    bool acked = gnss_wait_quectel_ack(0x06, 0x41, GNSS_SLEEP_ACK_TIMEOUT_MS);
+
+    // 3) 确认真的安静下来，并持续安静
+    bool quiet = gnss_wait_for_quiet2(1500, 5000);
+    uint32_t lines_after_quiet = gnss_lines_seen;
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    bool stays_quiet = (gnss_lines_seen == lines_after_quiet);
+    uint32_t elapsed = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "----- GNSS low-power entry report -----");
+    ESP_LOGI(TAG, "  发送前在输出    : %s (%lu 句/秒)   <== 关键项 1",
+             rate_before > 0 ? "YES" : "NO", (unsigned long)rate_before);
+    ESP_LOGI(TAG, "  发送后已静默    : %s              <== 关键项 2",
+             (quiet && stays_quiet) ? "YES" : "NO");
+    ESP_LOGI(TAG, "  ACK from module : %s (CFG-SLEEP 本就不回 ACK，仅供参考)",
+             acked ? "YES" : "NO");
+    ESP_LOGI(TAG, "  NMEA lines before/after : %lu / %lu",
+             (unsigned long)lines_before, (unsigned long)gnss_lines_seen);
+    ESP_LOGI(TAG, "  elapsed         : %lu ms", (unsigned long)elapsed);
+
+    if (rate_before == 0) {
+        // 模组本来就不出数据 —— 老代码的假阳性就是这个情况
+        gnss_in_standby = false;
+        ESP_LOGW(TAG, "  RESULT          : UNCONFIRMED - 发命令前模组就没在输出，");
+        ESP_LOGW(TAG, "                    静默说明不了任何问题，不能算进入低功耗");
+    } else if (quiet && stays_quiet) {
+        gnss_in_standby = true;
+        ESP_LOGI(TAG, "  RESULT          : ENTERED - 输出从 %lu 句/秒降到 0，命令生效",
+                 (unsigned long)rate_before);
+        ESP_LOGI(TAG, "                    此时量 VCC_LC760Z 应为 uA 量级");
+    } else {
+        gnss_in_standby = false;
+        ESP_LOGW(TAG, "  RESULT          : FAILED - 模组仍在输出，命令没被接受");
+    }
+    ESP_LOGI(TAG, "---------------------------------------");
+    return gnss_in_standby;
+}
+
+/* ==================== GNSS 低功耗协议探测 ====================
+ * 目的：让模组自己告诉我们它认哪套命令，而不是靠猜。
+ * 做法是"发一条、看有没有任何 $P 回应、看 NMEA 有没有停"，
+ * 不依赖预先知道各厂商 ACK 的确切格式。
+ * 约 40 秒跑完一轮，全部结论打在串口上。
+ * =========================================================== */
+
+typedef struct {
+    const char *body;      // 不含 $ 和校验和
+    const char *vendor;
+    const char *desc;
+} gnss_probe_cmd_t;
+
+/* 版本/身份查询。LC26xZ/LC76xZ 用的是 PQTM 专有语句，
+ * 其余几条留着做交叉验证——如果哪天换了模组，一眼能看出是哪家的。 */
+static const gnss_probe_cmd_t s_probe_version[] = {
+    { "PQTMVERNO",  "Quectel LC26xZ/LC76xZ", "查询版本（本板应答这条）" },
+    { "PMTK605",    "MediaTek",              "查询固件版本" },
+    { "PAIR021",    "Airoha/Quectel LC76G",  "查询固件版本" },
+    { "PCAS06,0",   "CASIC/Allystar",        "查询版本信息" },
+};
+
+// 发一条命令，等 timeout_ms，返回是否收到任何新的 $P 回应
+static bool probe_send_and_listen(const char *body, uint32_t timeout_ms, char *resp, size_t resp_sz)
+{
+    uint32_t prop_before = gnss_prop_count;
+    gnss_last_prop[0] = '\0';
+
+    gnss_send_nmea_cs(body);
+
+    TickType_t t0 = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        if (gnss_prop_count != prop_before) {
+            vTaskDelay(pdMS_TO_TICKS(200));   // 再等等，可能还有后续句
+            if (resp && resp_sz) {
+                strncpy(resp, gnss_last_prop, resp_sz - 1);
+                resp[resp_sz - 1] = '\0';
+            }
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (resp && resp_sz) { resp[0] = '\0'; }
+    return false;
+}
+
+void gnss_lp_probe_run(void)
+{
+    char resp[96];
+
+    ESP_LOGI(TAG, " ");
+    ESP_LOGI(TAG, "============================================================");
+    ESP_LOGI(TAG, "         GNSS 低功耗协议探测 (GNSS Low-Power Probe)");
+    ESP_LOGI(TAG, "============================================================");
+
+    /* ---- 1/4 观察模组在说什么 ---- */
+    ESP_LOGI(TAG, "[1/4] 观察模组输出 5 秒...");
+    gnss_talker_n = 0;
+    gnss_seen_pmtk = gnss_seen_pair = gnss_seen_pcas = gnss_seen_pq = false;
+    uint32_t lines0 = gnss_lines_seen;
+    uint32_t prop0  = gnss_prop_count;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    uint32_t lines = gnss_lines_seen - lines0;
+    uint32_t props = gnss_prop_count - prop0;
+
+    ESP_LOGI(TAG, "      NMEA 句数        : %lu (%.1f 句/秒)",
+             (unsigned long)lines, lines / 5.0f);
+    if (lines == 0) {
+        ESP_LOGE(TAG, "      模组没有任何输出，后面的探测没有意义。");
+        ESP_LOGE(TAG, "      先查 VCC_LC760Z / RESET_N / R34 / R36。");
+        ESP_LOGI(TAG, "============================================================");
+        return;
+    }
+    char talkers[32] = {0};
+    int tp = 0;
+    for (int k = 0; k < gnss_talker_n && tp < (int)sizeof(talkers) - 4; ++k) {
+        tp += snprintf(talkers + tp, sizeof(talkers) - tp, "%s ", gnss_talkers[k]);
+    }
+    ESP_LOGI(TAG, "      Talker ID        : %s", talkers[0] ? talkers : "(none)");
+    ESP_LOGI(TAG, "      专有语句($P)     : %lu 条  PMTK=%d PAIR=%d PCAS=%d PQ=%d",
+             (unsigned long)props, gnss_seen_pmtk, gnss_seen_pair, gnss_seen_pcas, gnss_seen_pq);
+    if (gnss_last_prop[0]) {
+        ESP_LOGI(TAG, "      最后一条专有语句 : %s", gnss_last_prop);
+    }
+
+    /* ---- 2/4 问它是谁 ---- */
+    ESP_LOGI(TAG, " ");
+    ESP_LOGI(TAG, "[2/4] 版本/身份查询（看哪家的命令有回应）");
+    const char *vendor_guess = NULL;
+    for (unsigned i = 0; i < sizeof(s_probe_version)/sizeof(s_probe_version[0]); ++i) {
+        const gnss_probe_cmd_t *c = &s_probe_version[i];
+        bool got = probe_send_and_listen(c->body, 1500, resp, sizeof(resp));
+        ESP_LOGI(TAG, "      $%-12s (%-16s) -> %s",
+                 c->body, c->vendor, got ? resp : "无回应");
+        if (got && !vendor_guess) { vendor_guess = c->vendor; }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    /* ---- 3/4 星历存储 + 二进制 CFG-SLEEP 实测 ---- */
+    ESP_LOGI(TAG, " ");
+    ESP_LOGI(TAG, "[3/4] 二进制 CFG-SLEEP (0x06 0x41) 实测");
+
+    ESP_LOGI(TAG, "      先使能星历存 Flash（热启动的前提）");
+    bool eph_ok = gnss_enable_ephemeris_save();
+    ESP_LOGI(TAG, "      CFG-EPHSAVE ACK  : %s", eph_ok ? "YES" : "NO");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "      进入 %s 模式...", GNSS_LP_USE_BACKUP ? "Backup(3)" : "Standby(1)");
+    bool entered = gnss_enter_standby2();
+
+    uint32_t wake_ms = 0;
+    bool woke = false;
+    if (entered) {
+        vTaskDelay(pdMS_TO_TICKS(3000));      // 睡一会儿，方便你这时候量电流
+        TickType_t tw = xTaskGetTickCount();
+        woke = gnss_wake_from_standby2();
+        wake_ms = (uint32_t)((xTaskGetTickCount() - tw) * portTICK_PERIOD_MS);
+
+        // 唤醒后测一次重新出定位的时间，用来判断星历有没有保住
+        ESP_LOGI(TAG, "      等待唤醒后重新定位（最多 60 秒，用于判断热/冷启动）...");
+        gnss_last_location.valid = false;
+        TickType_t tf = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - tf) < pdMS_TO_TICKS(60000)) {
+            if (gnss_last_location.valid) { break; }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        uint32_t fix_ms = (uint32_t)((xTaskGetTickCount() - tf) * portTICK_PERIOD_MS);
+        if (gnss_last_location.valid) {
+            ESP_LOGI(TAG, "      重新定位耗时     : %lu ms  (<5s 说明是热启动，星历保住了)",
+                     (unsigned long)fix_ms);
+        } else {
+            ESP_LOGW(TAG, "      60 秒内没有重新定位（可能在室内，或星历丢失走了冷启动）");
+        }
+    }
+
+    /* ---- 4/4 结论 ---- */
+    ESP_LOGI(TAG, " ");
+    ESP_LOGI(TAG, "[4/4] 结论");
+    ESP_LOGI(TAG, "      平台推测         : %s",
+             vendor_guess ? vendor_guess : "NMEA 查询无应答（本系列正常，它主要用二进制协议）");
+    ESP_LOGI(TAG, "      CFG-EPHSAVE      : %s", eph_ok ? "ACK" : "无 ACK");
+    ESP_LOGI(TAG, "      CFG-SLEEP 进入   : %s", entered ? "成功（收到 ACK 且串口静默）" : "失败");
+    if (entered) {
+        ESP_LOGI(TAG, "      唤醒             : %s, %lu ms",
+                 woke ? "成功" : "失败", (unsigned long)wake_ms);
+        ESP_LOGI(TAG, "      >>> 低功耗链路打通。睡眠期量 VCC_LC760Z 应为 uA 量级");
+    } else {
+        ESP_LOGW(TAG, "      >>> 没进去。看上面 [QBIN] 那几行：有没有收到 ACK-ACK/ACK-NAK");
+    }
+    ESP_LOGI(TAG, "============================================================");
+    ESP_LOGI(TAG, " ");
 }
 
 bool gnss_wake_from_standby2(void)
 {
-    ESP_LOGI(TAG, "Wake: TX 0xFF CRLF");
+    ESP_LOGI(TAG, "===== GNSS wake-up =====");
+    TickType_t t0 = xTaskGetTickCount();
+    uint32_t lines_before = gnss_lines_seen;
+    const char *method = "";
+
+#if GNSS_LP_USE_BACKUP
+    /* 手册 3.4.10 备注：Backup 模式下模块只能通过休眠时间结束或硬件重启唤醒。
+     * 我们把休眠时间设为 0（一直睡），所以只能靠 RESET_N。 */
+    method = "RESET_N pulse";
+    ESP_LOGI(TAG, "  method: %s on IO%d (>=100ms low) - Backup 只能硬件复位唤醒",
+             method, GNSS_RST_PIN);
+    gnss_reset_assert();
+    vTaskDelay(pdMS_TO_TICKS(120));
+    gnss_reset_release();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    uart_flush_input(GNSS_UART_NUM);
+#else
+    /* 手册 3.4.10 备注：Standby 模式可通过 UART 发送任意命令唤醒（靠电平变化），
+     * 也可以硬件复位。先试 UART，不行再复位。 */
+    method = "UART wake byte";
+    ESP_LOGI(TAG, "  method: %s (Standby 可由 UART 电平变换唤醒)", method);
     const uint8_t wake_seq[3] = {0xFF, '\r', '\n'};
     uart_write_bytes(GNSS_UART_NUM, (const char*)wake_seq, sizeof(wake_seq));
-    vTaskDelay(200 / portTICK_PERIOD_MS);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    if (!gnss_wait_for_activity2(1000)) {
+        method = "UART wake byte + RESET_N";
+        ESP_LOGI(TAG, "  UART 唤醒无响应，改用 RESET_N 脉冲");
+        gnss_reset_assert();
+        vTaskDelay(pdMS_TO_TICKS(120));
+        gnss_reset_release();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     uart_flush_input(GNSS_UART_NUM);
+#endif
 
-    if (gnss_wait_for_activity2(3000)) {
-        ESP_LOGI(TAG, "NMEA resumed after wake");
+    bool ok = gnss_wait_for_activity2(GNSS_WAKE_TIMEOUT_MS);
+    uint32_t ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "----- GNSS wake-up report -----");
+    ESP_LOGI(TAG, "  method          : %s", method);
+    ESP_LOGI(TAG, "  NMEA resumed    : %s", ok ? "YES" : "NO");
+    ESP_LOGI(TAG, "  time to 1st line: %lu ms", (unsigned long)ms);
+    ESP_LOGI(TAG, "  NMEA lines before/after : %lu / %lu",
+             (unsigned long)lines_before, (unsigned long)gnss_lines_seen);
+    ESP_LOGI(TAG, "-------------------------------");
+
+    if (ok) {
         gnss_in_standby = false;
         return true;
     }
-    ESP_LOGW(TAG, "No NMEA after wake within 3s");
+    ESP_LOGW(TAG, "No NMEA after wake within %d ms", GNSS_WAKE_TIMEOUT_MS);
     return false;
 }
 
@@ -549,6 +910,11 @@ void gnss_task(void* pv)
     enum {UBX_SYNC1, UBX_SYNC2, UBX_CLASS, UBX_ID, UBX_LEN1, UBX_LEN2, UBX_PAYLOAD, UBX_CKA, UBX_CKB} ubx_state = UBX_SYNC1;
     uint8_t ubx_cls=0, ubx_id=0; uint16_t ubx_len=0, ubx_pos=0; uint8_t ubx_ckA=0, ubx_ckB=0; uint8_t ubx_buf[256];
 
+    // Quectel 二进制帧解析状态机（帧头 F1 D9，Fletcher-8 校验）
+    enum {Q_S1, Q_S2, Q_GRP, Q_SUB, Q_L1, Q_L2, Q_PL, Q_C1, Q_C2} q_state = Q_S1;
+    uint8_t q_grp=0, q_sub=0; uint16_t q_len=0, q_pos=0;
+    uint8_t q_c1=0, q_c2=0, q_rx_c1=0; uint8_t q_buf[64];
+
     while (1) {
         if (gnss_should_stop) {
             ESP_LOGI(TAG, "Stopping GNSS receiver after benchmark");
@@ -564,6 +930,50 @@ void gnss_task(void* pv)
 
             for (int i = 0; i < len; ++i) {
                 char c = (char)buf[i];
+
+                // ---- Quectel 二进制帧解析（F1 D9）----
+                {
+                    uint8_t qb = (uint8_t)c;
+                    switch (q_state) {
+                        case Q_S1: if (qb == 0xF1) { q_state = Q_S2; } break;
+                        case Q_S2:
+                            if (qb == 0xD9) { q_state = Q_GRP; q_c1 = q_c2 = 0; }
+                            else { q_state = (qb == 0xF1) ? Q_S2 : Q_S1; }
+                            break;
+                        case Q_GRP: q_grp = qb; q_c1 += qb; q_c2 += q_c1; q_state = Q_SUB; break;
+                        case Q_SUB: q_sub = qb; q_c1 += qb; q_c2 += q_c1; q_state = Q_L1;  break;
+                        case Q_L1:  q_len  = qb; q_c1 += qb; q_c2 += q_c1; q_state = Q_L2; break;
+                        case Q_L2:
+                            q_len |= ((uint16_t)qb << 8); q_c1 += qb; q_c2 += q_c1;
+                            if (q_len > sizeof(q_buf)) { q_state = Q_S1; }
+                            else { q_pos = 0; q_state = q_len ? Q_PL : Q_C1; }
+                            break;
+                        case Q_PL:
+                            q_buf[q_pos++] = qb; q_c1 += qb; q_c2 += q_c1;
+                            if (q_pos >= q_len) { q_state = Q_C1; }
+                            break;
+                        case Q_C1: q_rx_c1 = qb; q_state = Q_C2; break;
+                        case Q_C2:
+                            if (q_rx_c1 == q_c1 && qb == q_c2) {
+                                // 校验通过。ACK-ACK = 05/01，ACK-NAK = 05/00
+                                if (q_grp == 0x05 && q_len >= 2) {
+                                    gnss_qack_group  = q_buf[0];
+                                    gnss_qack_sub    = q_buf[1];
+                                    gnss_qack_is_ack = (q_sub == 0x01);
+                                    gnss_qack_seen   = true;
+                                    ESP_LOGI(TAG, "[QBIN] %s <- for msg %02X/%02X",
+                                             gnss_qack_is_ack ? "ACK-ACK" : "ACK-NAK",
+                                             q_buf[0], q_buf[1]);
+                                    if (q_buf[0] == 0x06 && q_buf[1] == 0x41) {
+                                        if (gnss_qack_is_ack) { gnss_ack_cfg_sleep = true; }
+                                        else                  { gnss_nak_cfg_sleep = true; }
+                                    }
+                                }
+                            }
+                            q_state = Q_S1;
+                            break;
+                    }
+                }
 
                 // UBX 解析
                 uint8_t b = (uint8_t)c;
@@ -608,6 +1018,55 @@ void gnss_task(void* pv)
                     if (line_len > 0) {
                         // 打印整句 NMEA（可由宏控制开关）
                         GNSS_RAW_LOG("%s", line);
+                        // ---- 协议探测用的统计 ----
+                        if (line[0] == '$') {
+                            if (line[1] == 'P') {
+                                // 专有语句：记下最后一条原文和前缀
+                                gnss_prop_count++;
+                                strncpy(gnss_last_prop, line, sizeof(gnss_last_prop) - 1);
+                                gnss_last_prop[sizeof(gnss_last_prop) - 1] = '\0';
+                                if (strncmp(line, "$PMTK", 5) == 0) { gnss_seen_pmtk = true; }
+                                else if (strncmp(line, "$PAIR", 5) == 0) { gnss_seen_pair = true; }
+                                else if (strncmp(line, "$PCAS", 5) == 0) { gnss_seen_pcas = true; }
+                                else if (strncmp(line, "$PQ", 3) == 0)   { gnss_seen_pq   = true; }
+                            } else if (line_len >= 6) {
+                                // 标准语句：收集 talker ID（$GN / $GP / $GL / $GA / $BD ...）
+                                bool known = false;
+                                for (int k = 0; k < gnss_talker_n; ++k) {
+                                    if (gnss_talkers[k][0] == line[1] && gnss_talkers[k][1] == line[2]) {
+                                        known = true; break;
+                                    }
+                                }
+                                if (!known && gnss_talker_n < 8) {
+                                    gnss_talkers[gnss_talker_n][0] = line[1];
+                                    gnss_talkers[gnss_talker_n][1] = line[2];
+                                    gnss_talkers[gnss_talker_n][2] = '\0';
+                                    gnss_talker_n++;
+                                }
+                            }
+                        }
+
+                        // Quectel PAIR ACK：$PAIR001,<cmd>,<result>
+                        // 手写解析，不用 sscanf —— 它在本任务 4096 的栈上开销太大
+                        if (strncmp(line, "$PAIR001,", 9) == 0) {
+                            const char *p = line + 9;
+                            int cmd = 0, res = 0;
+                            bool ok = (*p >= '0' && *p <= '9');
+                            while (*p >= '0' && *p <= '9') { cmd = cmd * 10 + (*p++ - '0'); }
+                            if (ok && *p == ',') {
+                                ++p;
+                                ok = (*p >= '0' && *p <= '9');
+                                while (*p >= '0' && *p <= '9') { res = res * 10 + (*p++ - '0'); }
+                            } else {
+                                ok = false;
+                            }
+                            if (ok) {
+                                gnss_pair_ack_cmd    = cmd;
+                                gnss_pair_ack_result = res;
+                                gnss_pair_ack_seen   = true;
+                                ESP_LOGI(TAG, "[PAIR] RX <- %s", line);
+                            }
+                        }
                         // 待机命令ACK检测
                         if (strstr(line, "$PMTK001,161,3") != NULL) {
                             gnss_ack_pmtk161 = true;
@@ -646,7 +1105,16 @@ void gnss_task(void* pv)
         // 超过2秒没有"完成一行"，输出心跳
         if ((xTaskGetTickCount() - last_line_tick) >= pdMS_TO_TICKS(2000)) {
             if (bytes_since_line == 0) {
-                ESP_LOGI(TAG, "Waiting for NMEA on UART2 (TX=%d, RX=%d, %d)...", GNSS_UART_TX, GNSS_UART_RX, GNSS_BAUD);
+                if (gnss_in_standby) {
+                    // 已确认进入低功耗，安静是预期行为。降频打印，避免刷屏
+                    static uint32_t quiet_ticks = 0;
+                    if ((quiet_ticks++ % 15) == 0) {   // 约每 30 秒一条
+                        ESP_LOGI(TAG, "GNSS in low-power, UART quiet as expected (%lus)",
+                                 (unsigned long)(quiet_ticks * 2));
+                    }
+                } else {
+                    ESP_LOGI(TAG, "Waiting for NMEA on UART2 (TX=%d, RX=%d, %d)...", GNSS_UART_TX, GNSS_UART_RX, GNSS_BAUD);
+                }
             } else {
                 // 有数据但无换行，多半是波特率不匹配或线路噪声
                 char hex[16 * 3 + 1];

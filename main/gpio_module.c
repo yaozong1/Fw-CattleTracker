@@ -40,9 +40,17 @@ void gpio_init(void)
     gpio_set_level(MODEM_RESET_PIN, 0);         // 不复位
 
     gpio_set_direction(MODEM_EN_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(MODEM_EN_PIN, 0);            // 低有效：打开 3.8V 供电
+    // 默认不通电：模组要到真正上报时才开轨，省掉搜星那一段的 LDO 空载电流
+    gpio_set_level(MODEM_EN_PIN, MODEM_RAIL_ON_AT_BOOT ? MODEM_EN_ON_LEVEL
+                                                       : MODEM_EN_OFF_LEVEL);
 
+    /* IO35 <- TXB0108 B8（模组 STATUS 经电平转换），板上已有 R13 100K 下拉。
+     * 这里必须把 ESP32 的内部上下拉全关掉：芯片复位后部分 pad 的内部上拉是打开的，
+     * 45K 内部上拉对着 100K 外部下拉会形成分压，一方面读数变成 2.3V 的中间态，
+     * 另一方面恒定漏 3.3V/145K ≈ 23 µA。外部电阻已经定了电平，内部不要插手。 */
     gpio_set_direction(MODEM_STATUS_PIN, GPIO_MODE_INPUT);
+    gpio_pullup_dis(MODEM_STATUS_PIN);
+    gpio_pulldown_dis(MODEM_STATUS_PIN);
 
     /* ---- GNSS ---- */
     gpio_set_direction(GNSS_EN_PIN, GPIO_MODE_OUTPUT);
@@ -67,12 +75,13 @@ void gpio_init(void)
 
 void power_control_init(void)
 {
-    // 打开模组供电与 GNSS 供电，复位脚释放
-    gpio_set_level(MODEM_EN_PIN, 0);   // 低有效
+    // GNSS 必须常电（Backup 靠 VCC 保持星历）；模组轨按 MODEM_RAIL_ON_AT_BOOT 决定
+    modem_power_enable(MODEM_RAIL_ON_AT_BOOT ? true : false);
     gpio_set_level(GNSS_EN_PIN, 1);
     gpio_set_level(GNSS_RST_PIN, 0);
 
-    ESP_LOGI(TAG, "Power control pins initialized (modem ON, GNSS ON)");
+    ESP_LOGI(TAG, "Power control pins initialized (modem rail %s, GNSS ON)",
+             MODEM_RAIL_ON_AT_BOOT ? "ON" : "OFF");
 }
 
 /* ============ 电子围栏 ============ */
@@ -99,6 +108,72 @@ void fence_pins_safe_init(void)
     s_fence_rails_on = false;
 
     ESP_LOGI(TAG, "Fence pins in SAFE state (charge off, no trigger)");
+}
+
+/* ================= deep sleep 引脚状态 =================
+ *
+ * 深睡时数字 IO 整块断电，所有输出脚变高阻（悬空），电平由板上的电阻决定。
+ * 这里只调 gpio_deep_sleep_hold_en()，**不做任何逐脚 gpio_hold_en()**。
+ *
+ * 为什么不用逐脚 hold：对 IO0~IO21 它走的是 RTC 域的锁存器，一旦使用，
+ * RTC_PERIPH 电源域整个休眠期不能断电。实测代价 +405 µA（112 → 490 µA）。
+ * 而 gpio_deep_sleep_hold_en() 走数字域，不依赖那个域，但它只管 IO22 以上的
+ * 纯数字脚，对 RTC 脚无效——所以 IO0~IO21 的电平必须由外部电阻保证。
+ *
+ * 各脚在深睡期间靠什么定电平：
+ *   IO11 GNSS_EN      100K 上拉到 3V3   -> 高，U21 保持使能，星历不丢（热启动）
+ *   IO2  GNSS_RST     Q6(KRC106S) 内部基极下拉 -> 低，不复位
+ *   IO12 5V0_ISO_EN   R63 10K 下拉      -> 低
+ *   IO47 12V_EN       R77 10K 下拉      -> 低（非 RTC 脚，本来也 hold 不了）
+ *   IO13 Trig         R89 220 接可控硅栅极网络 -> 低
+ *   IO48 MODEM_EN     板上下拉（高有效）-> 低，3.8V 轨断开
+ *   IO9  C_EN         ⚠ 目前没有任何电阻定电平，深睡期间悬空
+ *
+ * ⚠ IO9 待办：它直连 LT3750(U12) 的 CHARGE。现在 D25 翘着、U12 没有 VCC，
+ *   所以悬空无害；**装回 D25 之前必须先给 IO9 补一颗 100K 对地下拉**，
+ *   否则高压电容充电器有自启的可能。
+ *
+ * ⚠ DEEPSLEEP_WAKE_ON_BUTTON：ext0 唤醒同样要求 RTC_PERIPH 供电，
+ *   打开它会把那 405 µA 原样加回来。见 hardware_config.h。
+ *
+ * 实测（1800 mAh 电池，3.7 V 侧）：深睡 112 µA，GNSS 保持 Backup，唤醒热启动。
+ * ====================================================== */
+#define RTC_GPIO_MAX_NUM 21
+
+void deep_sleep_prepare_pins(void)
+{
+    ESP_LOGI(TAG, "Deep sleep: 设置引脚电平（靠板上电阻在休眠期保持）");
+
+    // GNSS 供电保持，否则备份域星历丢失，唤醒后变冷启动
+    gpio_set_level(GNSS_EN_PIN, 1);
+    gpio_set_level(GNSS_RST_PIN, 0);
+
+    // 围栏相关一律拉低
+    gpio_set_level(FENCE_TRIG_PIN, 0);
+    gpio_set_level(FENCE_CHARGE_EN_PIN, 0);
+    gpio_set_level(FENCE_5V_ISO_EN_PIN, 0);
+    gpio_set_level(FENCE_12V_EN_PIN, 0);
+
+    // 模组 3.8V 轨断开；IO48 非 RTC 脚，休眠期靠板上的下拉保持关断
+    modem_power_enable(false);
+#if MODEM_EN_ACTIVE_HIGH
+    gpio_pulldown_en(MODEM_EN_PIN);     // 多一层保险，和板上的下拉同向
+    gpio_pullup_dis(MODEM_EN_PIN);
+#else
+    ESP_LOGW(TAG, "  IO%-2d (MODEM_EN) 低有效，深睡浮空 -> 3.8V 轨会自行恢复通电",
+             MODEM_EN_PIN);
+#endif
+
+    // LED 关掉
+    gpio_set_level(LED_ESP_PIN, 0);
+    gpio_set_level(LED_CONN_PIN, 0);
+
+    gpio_deep_sleep_hold_en();
+}
+
+void deep_sleep_release_pins(void)
+{
+    gpio_deep_sleep_hold_dis();
 }
 
 void fence_rails_enable(bool on)
@@ -156,9 +231,11 @@ bool fence_charge_done(void)
 /* ============ 模组电源 ============ */
 void modem_power_enable(bool on)
 {
-    // IO48 -> Q5 -> LDO EN（反相），低电平打开供电
-    gpio_set_level(MODEM_EN_PIN, on ? 0 : 1);
-    ESP_LOGI(TAG, "Modem 3.8V rail %s", on ? "ON" : "OFF");
+    // 极性由 MODEM_EN_ACTIVE_HIGH 决定，见 hardware_config.h
+    gpio_set_level(MODEM_EN_PIN, on ? MODEM_EN_ON_LEVEL : MODEM_EN_OFF_LEVEL);
+    ESP_LOGI(TAG, "Modem 3.8V rail %s (IO%d=%d)",
+             on ? "ON" : "OFF", MODEM_EN_PIN,
+             on ? MODEM_EN_ON_LEVEL : MODEM_EN_OFF_LEVEL);
 }
 
 bool modem_is_powered(void)

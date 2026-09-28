@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gnss_module.h"
@@ -28,6 +29,15 @@ typedef enum {
 #define MQTT_QOS_LEVEL 0
 #endif
 
+// 设备标识：deviceId 绑定模组 IMEI。
+// device_fetch_imei() 在网络初始化时自动调一次，成功后结果被缓存。
+bool device_fetch_imei(void);
+const char* device_get_id(void);
+bool device_id_is_imei(void);
+
+// 拼出 fleet/<deviceId>/<suffix>，deviceId 取自 IMEI
+void mqtt_build_topic(char *out, size_t out_sz, const char *suffix);
+
 // AT命令函数
 void send_at_command(const char* command);
 bool wait_for_ok(uint32_t timeout_ms);
@@ -39,6 +49,18 @@ bool mqtt_connect_broker(void);
 bool mqtt_publish_message(const char* topic, const char* message);
 bool mqtt_disconnect_broker(void);
 void mqtt_poll_urc(void);
+
+// 在唤醒模组之前采一次空载电池电压，供本轮上报使用
+void battery_snapshot_idle(void);
+
+// RTC 内存里的跨深睡计数器（实现在 main.c）
+uint32_t app_get_boot_count(void);
+void app_note_fix_ok(void);
+void app_note_publish_ok(void);
+
+// 手动上报：不管有没有 GNSS 定位都发一条当前 payload。
+// 立即返回，实际工作在独立的一次性任务里完成。
+void mqtt_manual_publish_request(void);
 
 // 业务功能函数
 bool publish_gps_payload(void);
