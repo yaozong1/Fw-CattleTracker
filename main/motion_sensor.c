@@ -2,11 +2,30 @@
 #include "hardware_config.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <math.h>
+#include "esp_sleep.h"
 
 static const char *TAG = "MOTION_SENSOR";
+
+/* 深睡唤醒等同复位，motion_sensor_init() 会重新跑一遍，而它里面的
+ * lis2dh12_configure(100Hz, HR) 会把 CTRL_REG1/4 改掉 —— ODR 变 10 倍、
+ * 工作模式从 LP 切到 HR，高通滤波器输出上就是一个大台阶，当场把中断锁存了。
+ * 所以锁存位必须在任何重新配置【之前】读走，读到的值缓存在这里。 */
+static uint8_t s_latch_src    = 0;
+static bool    s_latch_cached = false;
+
+/* 把 INT1_SRC 的位解出来，方便看是哪个轴哪个方向触发的 */
+static void log_int1_src(const char *tag, uint8_t src)
+{
+    ESP_LOGI(TAG, "%s INT1_SRC=0x%02X [IA=%d ZH=%d ZL=%d YH=%d YL=%d XH=%d XL=%d]",
+             tag, src,
+             !!(src & 0x40), !!(src & 0x20), !!(src & 0x10),
+             !!(src & 0x08), !!(src & 0x04), !!(src & 0x02), !!(src & 0x01));
+}
+
 
 // I2C配置
 #define I2C_MASTER_NUM           I2C_NUM_0
@@ -185,7 +204,7 @@ bool lis2dh12_configure(lis2dh12_odr_t odr, lis2dh12_fs_t full_scale)
     }
     
     // 配置CTRL_REG4: 设置满量程和高分辨率模式
-    uint8_t ctrl_reg4 = full_scale | 0x08;  // 0x08 = 高分辨率模式
+    uint8_t ctrl_reg4 = full_scale | 0x88;  // 0x80 = BDU(高低字节同一采样), 0x08 = 高分辨率模式
     if (!lis2dh12_write_register(LIS2DH12_CTRL_REG4, ctrl_reg4)) {
         ESP_LOGE(TAG, "Failed to configure CTRL_REG4");
         return false;
@@ -208,16 +227,35 @@ bool lis2dh12_data_ready(void)
     return (status & 0x08) != 0;
 }
 
+/* 连读多个寄存器：子地址置 bit7 打开自动递增，一次 I2C 事务取完。
+ * 六个输出寄存器必须在同一次事务里读完 —— 分成 6 次事务的话，
+ * 50 kHz 下要 ~5 ms，这期间 100 Hz 的 ODR 会更新半次，
+ * X/Y/Z 来自不同时刻，算出来的矢量差既失真又偏小。 */
+static bool lis2dh12_read_burst(uint8_t reg_addr, uint8_t *buf, size_t len)
+{
+    if (len == 0) return false;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (lis2dh12_addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg_addr | 0x80, true);      /* bit7 = 自动递增 */
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (lis2dh12_addr << 1) | I2C_MASTER_READ, true);
+    if (len > 1) i2c_master_read(cmd, buf, len - 1, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, buf + len - 1, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
+    i2c_cmd_link_delete(cmd);
+    return err == ESP_OK;
+}
+
 bool lis2dh12_read_raw_data(lis2dh12_raw_data_t* data)
 {
     uint8_t raw_data[6];
     
-    // 读取6个字节的原始数据 (X_L, X_H, Y_L, Y_H, Z_L, Z_H)
-    for (int i = 0; i < 6; i++) {
-        if (!lis2dh12_read_register(LIS2DH12_OUT_X_L + i, &raw_data[i])) {
-            ESP_LOGE(TAG, "Failed to read acceleration data");
-            return false;
-        }
+    // 一次事务读完 6 个字节 (X_L, X_H, Y_L, Y_H, Z_L, Z_H)，保证三轴同时刻
+    if (!lis2dh12_read_burst(LIS2DH12_OUT_X_L, raw_data, 6)) {
+        ESP_LOGE(TAG, "Failed to read acceleration data");
+        return false;
     }
     
     // 组合高低字节 (12位数据左对齐在16位中)
@@ -334,12 +372,21 @@ bool motion_sensor_init(void)
         return false;
     }
     
-    // 等待传感器稳定
-    ESP_LOGI(TAG, "Waiting for sensor stabilization...");
-    vTaskDelay(200 / portTICK_PERIOD_MS);
-    
-    // 扫描I2C设备
+    /* 深睡唤醒时加速度计从未掉电，不需要等稳定，也不需要扫总线 ——
+     * 这两项加起来每轮约 630 ms，是静止轮次里最容易省掉的一段。
+     * 上电/复位启动时照常执行，调试手段不丢。 */
+    bool cold = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);
+
+    if (cold) {
+        ESP_LOGI(TAG, "Waiting for sensor stabilization...");
+        vTaskDelay(MOTION_INIT_SETTLE_MS / portTICK_PERIOD_MS);
+    }
+
+#if MOTION_I2C_SCAN_ON_WAKE
     i2c_scan_devices();
+#else
+    if (cold) { i2c_scan_devices(); }
+#endif
     
     // 检查设备ID
     ESP_LOGI(TAG, "Checking device ID...");
@@ -354,6 +401,17 @@ bool motion_sensor_init(void)
         return false;
     }
     
+    /* 先把上一个睡眠窗口的锁存位读走，再动任何配置。
+     * 顺序颠倒的话，下面 configure() 造成的滤波器瞬态会把锁存重新置上，
+     * 读到的就永远是「动过」。 */
+    if (lis2dh12_read_register(LIS2DH12_INT1_SRC, &s_latch_src)) {
+        s_latch_cached = true;
+        log_int1_src("开机先读锁存（重配置之前）", s_latch_src);
+    } else {
+        s_latch_cached = false;
+        ESP_LOGW(TAG, "开机读 INT1_SRC 失败");
+    }
+
     // 配置传感器: 100Hz输出率, ±2g满量程
     if (!lis2dh12_configure(LIS2DH12_ODR_100HZ, LIS2DH12_FS_2G)) {
         ESP_LOGE(TAG, "Failed to configure LIS2DH12");
@@ -387,6 +445,221 @@ bool motion_sensor_power_down(void)
     return ok;
 }
 
+
+/* ================= 阶段一：锁存 bit + 5 秒采样 ================= */
+
+bool motion_arm_for_sleep(void)
+{
+    s_motion_stop = true;
+#if !ENABLE_TRACKING_POLICY
+    /* 只有 motion_sensor_task 在跑时才需要等它退出让出 I2C；
+     * 启用运动策略时那个任务根本没创建，这 150 ms 是白等的。 */
+    vTaskDelay(pdMS_TO_TICKS(150));
+#endif
+
+    uint8_t dummy, rb;
+
+    /* 1) 先把中断生成器关掉再改配置，免得改的过程中乱触发 */
+    lis2dh12_write_register(LIS2DH12_INT1_CFG, 0x00);
+
+    /* 2) CTRL_REG1 = 10 Hz + LPen(bit3) + XYZ。datasheet Table 12: 3 µA */
+    if (!lis2dh12_write_register(LIS2DH12_CTRL_REG1, LIS2DH12_ODR_10HZ | 0x08 | 0x07)) return false;
+
+    /* 3) CTRL_REG2：HPM=10（Normal mode，自动跟踪去直流）+ bit0 HP_IA1。
+     *    原来用 HPM=00（靠读 REFERENCE 手动复位），对时序很敏感 ——
+     *    10 Hz 下一个采样周期是 100 ms，写完 CTRL_REG1 立刻读 REFERENCE
+     *    会把还没更新的无效值当成基准，滤波器减不掉重力，
+     *    结果静止时 ZH 一直置位。改成自动跟踪就不依赖这个时序了。 */
+    if (!lis2dh12_write_register(LIS2DH12_CTRL_REG2, 0x80 | 0x01)) return false;
+
+    /* 4) CTRL_REG3 bit6 = I1_IA1：输出到 INT1 引脚（IO17），只作冗余 */
+    if (!lis2dh12_write_register(LIS2DH12_CTRL_REG3, 0x40)) return false;
+
+    /* 5) CTRL_REG4 = ±2g，低功耗模式下 HR 位必须为 0 */
+    if (!lis2dh12_write_register(LIS2DH12_CTRL_REG4, LIS2DH12_FS_2G)) return false;
+
+    /* 6) CTRL_REG5 bit3 = LIR_INT1：中断锁存，直到读 INT1_SRC 才清 */
+    if (!lis2dh12_write_register(LIS2DH12_CTRL_REG5, 0x08)) return false;
+
+    /* 7) 阈值。±2g 量程下 INT1_THS 是 16 mg/LSB */
+    uint8_t ths = (uint8_t)(MOTION_LATCH_THS_MG / 16);
+    if (ths == 0)  ths = 1;
+    if (ths > 127) ths = 127;
+    if (!lis2dh12_write_register(LIS2DH12_INT1_THS, ths)) return false;
+
+    /* 8) 持续时间。1 LSB = 1/ODR = 100 ms @10Hz */
+    uint8_t dur = (uint8_t)(MOTION_LATCH_DUR_MS / 100);
+    if (dur > 127) dur = 127;
+    if (!lis2dh12_write_register(LIS2DH12_INT1_DURATION, dur)) return false;
+
+    /* 9) 关键：等模式切换 + 高通滤波器稳定。
+     *    10 Hz 下一个样本 100 ms，HPCF=00 的截止频率约 ODR/50，
+     *    给 5 个采样周期（500 ms）让滤波器把重力收敛掉。 */
+    vTaskDelay(pdMS_TO_TICKS(MOTION_ARM_SETTLE_MS));
+    lis2dh12_read_register(LIS2DH12_REFERENCE, &dummy);   /* 保险起见再复位一次 */
+    vTaskDelay(pdMS_TO_TICKS(MOTION_ARM_REF_WAIT_MS));
+
+    /* 10) 写回校验 —— 确认寄存器真的写进去了，而不是 I2C 静默失败 */
+    bool cfg_ok = true;
+    if (!lis2dh12_read_register(LIS2DH12_CTRL_REG1, &rb) || rb != (LIS2DH12_ODR_10HZ|0x08|0x07)) {
+        ESP_LOGW(TAG, "CTRL_REG1 回读 0x%02X，期望 0x2F", rb); cfg_ok = false; }
+    if (!lis2dh12_read_register(LIS2DH12_CTRL_REG2, &rb) || rb != 0x81) {
+        ESP_LOGW(TAG, "CTRL_REG2 回读 0x%02X，期望 0x81（HPF 没生效！）", rb); cfg_ok = false; }
+    if (!lis2dh12_read_register(LIS2DH12_CTRL_REG5, &rb) || rb != 0x08) {
+        ESP_LOGW(TAG, "CTRL_REG5 回读 0x%02X，期望 0x08（锁存没开）", rb); cfg_ok = false; }
+
+    /* 11) 使能中断生成器：任一轴 high 事件（OR 组合）
+     *     bit5 ZHIE | bit3 YHIE | bit1 XHIE = 0x2A */
+    if (!lis2dh12_write_register(LIS2DH12_INT1_CFG, 0x2A)) return false;
+
+    /* 12) 反复清锁存直到它保持干净。滤波器刚使能时可能还有残余瞬态，
+     *     清一次不够 —— 清到连续读两次都是 IA=0 才算布防成功。 */
+    uint8_t src = 0xFF;
+    int tries = 0;
+    for (; tries < 10; ++tries) {
+        vTaskDelay(pdMS_TO_TICKS(MOTION_ARM_CLEAR_STEP_MS));
+        if (!lis2dh12_read_register(LIS2DH12_INT1_SRC, &src)) break;
+        if ((src & 0x40) == 0) {
+            /* 再确认一次，确保不是刚好读在两次触发之间 */
+            vTaskDelay(pdMS_TO_TICKS(MOTION_ARM_CLEAR_STEP_MS));
+            if (lis2dh12_read_register(LIS2DH12_INT1_SRC, &src) && (src & 0x40) == 0) break;
+        }
+    }
+
+    if ((src & 0x40) != 0) {
+        log_int1_src("布防后仍在触发（静止时不该如此）", src);
+        ESP_LOGW(TAG, "清锁存 %d 次仍未干净 —— 检查 HPF 是否生效，或阈值 %u mg 是否偏低",
+                 tries, (unsigned)MOTION_LATCH_THS_MG);
+    } else {
+        ESP_LOGI(TAG, "LIS2DH12 睡眠布防完成：10Hz 低功耗(~3uA) HPF自动 阈值 %u mg(THS=%u) "
+                      "持续 %u ms(DUR=%u) 锁存已清（用了 %d 次）%s",
+                 (unsigned)MOTION_LATCH_THS_MG, ths, (unsigned)MOTION_LATCH_DUR_MS, dur,
+                 tries + 1, cfg_ok ? "" : " [配置回读有异常]");
+    }
+    return true;
+}
+bool motion_read_and_clear_latch(void)
+{
+    uint8_t src = 0;
+
+    /* 正常路径：用 motion_sensor_init() 在重配置之前缓存下来的那个值。
+     * 这里再读一次的话，读到的是 init 自己造成的瞬态，不是睡眠窗口的真实情况。 */
+    if (s_latch_cached) {
+        s_latch_cached = false;
+        bool ia_c = (s_latch_src & 0x40) != 0;
+        log_int1_src(ia_c ? "睡眠窗口：动过" : "睡眠窗口：全程静止", s_latch_src);
+        return ia_c;
+    }
+
+    ESP_LOGW(TAG, "没有开机缓存的锁存值，现场读一次（可能已被重配置污染）");
+    if (!lis2dh12_read_register(LIS2DH12_INT1_SRC, &src)) {
+        ESP_LOGW(TAG, "读 INT1_SRC 失败，保守起见按\"动过\"处理");
+        return true;
+    }
+    bool ia = (src & 0x40) != 0;   /* bit6 = IA (interrupt active) */
+    log_int1_src(ia ? "睡眠窗口：动过" : "睡眠窗口：全程静止", src);
+    return ia;
+}
+
+int motion_activity_mg(uint32_t window_ms, int *pct_out, int *peak_mg_out)
+{
+    /* ODR 开到 100 Hz，而采样间隔是 20 ms(50 Hz)：保证每次读到的都是新样本。
+     * 帧差判据下读到重复样本会被算成「没动」，会系统性压低活动占比。
+     * 常规(HR)模式，和 lis2dh12_read_accel_data() 的 1 mg/LSB 标定一致。
+     * 这几秒 ESP32 本来就醒着(~40 mA)，传感器那几十 µA 无所谓。 */
+    if (!lis2dh12_configure(LIS2DH12_ODR_100HZ, LIS2DH12_FS_2G)) return -1;
+    vTaskDelay(pdMS_TO_TICKS(120));   /* 换 ODR 后丢掉过渡样本 */
+
+    const uint32_t period_ms = MOTION_SAMPLE_PERIOD_MS;
+    const float    th_g      = MOTION_DELTA_TH_MG / 1000.0f;
+    const float    rel_g     = th_g * 0.5f;      /* 只影响诊断用的沿计数 */
+
+    int      total = 0, active = 0, edges = 0, bad = 0;
+    bool     above = false, first = true, have_prev = false;
+    uint32_t last_ms = 0, t = 0;
+    float    peak_d = 0.0f, peak_m = 0.0f;
+    float    px = 0.0f, py = 0.0f, pz = 0.0f;
+    float    sum_d = 0.0f;
+
+    /* 逐秒明细：用来区分「幅度不够」和「动得断断续续」。
+     * 两者都表现为占比偏低，但处理方式完全相反 —— 前者调阈值，
+     * 后者说明窗口判据本身选错了。 */
+    #define ACT_SEC_MAX 10
+    int   sec_tot[ACT_SEC_MAX] = {0}, sec_act[ACT_SEC_MAX] = {0};
+    float sec_pk[ACT_SEC_MAX]  = {0}, sec_sum[ACT_SEC_MAX] = {0};
+    uint32_t t0_us = (uint32_t)esp_timer_get_time();
+
+    while (t < window_ms) {
+        lis2dh12_accel_data_t a;
+        if (lis2dh12_read_accel_data(&a)) {
+            /* 对照用：旧判据 |‖a‖ − 1g|，只进日志 */
+            float mag = sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+            float m   = fabsf(mag - 1.0f);
+            if (m > peak_m) peak_m = m;
+
+            if (have_prev) {
+                /* 主判据：相邻帧的矢量差。旋转会让重力在轴间转移，
+                 * 模长不变但帧差很大 —— 这正是摇头/翻转要抓的信号。 */
+                float dx = a.x - px, dy = a.y - py, dz = a.z - pz;
+                float d  = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (d > peak_d) peak_d = d;
+                total++;
+
+                sum_d += d;
+                int si = t / 1000; if (si >= ACT_SEC_MAX) si = ACT_SEC_MAX - 1;
+                sec_tot[si]++; sec_sum[si] += d;
+                if (d > sec_pk[si]) sec_pk[si] = d;
+
+                if (d > th_g) {
+                    active++;                      /* 这一帧算「在动」 */
+                    sec_act[si]++;
+                    if (!above) {
+                        above = true;
+                        if (first || (t - last_ms) >= MOTION_EVENT_DEBOUNCE_MS) {
+                            edges++; last_ms = t; first = false;   /* 仅诊断 */
+                        }
+                    }
+                } else if (above && d < rel_g) {
+                    above = false;
+                }
+            }
+            px = a.x; py = a.y; pz = a.z;
+            have_prev = true;
+        } else {
+            if (++bad > 5) { ESP_LOGW(TAG, "采样期间 I2C 连续失败，放弃本次判定"); return -1; }
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+        t += period_ms;
+    }
+
+    int pct  = total ? (active * 100) / total : 0;
+    int mean = total ? (int)((sum_d / total) * 1000.0f + 0.5f) : 0;
+
+    ESP_LOGI(TAG, "运动采样：%lu ms / %d 点 -> 平均帧差 %d mg（门限 %d mg）"
+                  "｜峰值 %.0f mg，>%u mg 占比 %d%%，沿计数 %d 次｜(对照 |‖a‖-1g| 峰值 %.0f mg)",
+             (unsigned long)window_ms, total, mean, MOTION_MEAN_DELTA_TH_MG,
+             (double)(peak_d * 1000.0f), (unsigned)MOTION_DELTA_TH_MG, pct, edges,
+             (double)(peak_m * 1000.0f));
+
+    /* 逐秒明细 + 真实耗时（t 是累加出来的名义时间，不含 I2C 和调度开销） */
+    {
+        char line[180]; int n = 0; int secs = (window_ms + 999) / 1000;
+        if (secs > ACT_SEC_MAX) secs = ACT_SEC_MAX;
+        for (int i = 0; i < secs && n < (int)sizeof(line) - 28; i++) {
+            n += snprintf(line + n, sizeof(line) - n, "%s%.0f/%.0f",
+                          i ? " | " : "",
+                          sec_tot[i] ? (double)(sec_sum[i] / sec_tot[i] * 1000.0f) : 0.0,
+                          (double)(sec_pk[i] * 1000.0f));
+        }
+        ESP_LOGI(TAG, "  逐秒(平均/峰值 mg)：%s｜实际耗时 %lu ms",
+                 line, (unsigned long)(((uint32_t)esp_timer_get_time() - t0_us) / 1000));
+    }
+    #undef ACT_SEC_MAX
+
+    if (pct_out)     *pct_out     = pct;
+    if (peak_mg_out) *peak_mg_out = (int)(peak_d * 1000.0f);
+    return mean;
+}
 void motion_sensor_task(void* pvParameters)
 {
     ESP_LOGI(TAG, "Motion sensor task started");

@@ -5,6 +5,7 @@
 #include "gpio_module.h"
 #include "battery_module.h"
 #include "motion_sensor.h"
+#include "tracking_policy.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -856,6 +857,22 @@ static int build_battery_json(char *payload, size_t payload_sz)
      * 所以电池各项不能再包在 "battery": {} 里，且字段名是 estimatedRangeKm。
      * deviceId 与 timestamp 后端并不读取（设备身份取自主题、时间戳用服务器本地时间），
      * 这里保留只是为了排查时方便对照。 */
+    /* 本轮的运动判定，后台据此知道这条是 HIGH 还是 LOW 报的、当时动了几次 */
+    char track_part[128] = "";
+#if ENABLE_TRACKING_POLICY
+    {
+        track_output_t to; track_input_t ti;
+        track_last_snapshot(&to, &ti);
+        snprintf(track_part, sizeof(track_part),
+                 ",\"track\":{\"mode\":\"%s\",\"event\":\"%s\",\"latched\":%s,\"act_mg\":%d,\"streak\":%u,\"doubt\":%u}",
+                 track_mode_str(to.mode),
+                 to.event == TRACK_EV_MOTION ? "motion" :
+                 to.event == TRACK_EV_STILL  ? "still"  : "doubt",
+                 ti.latched ? "true" : "false",
+                 ti.activity_mg, to.streak, to.doubt);
+    }
+#endif
+
     int n = snprintf(payload, payload_sz,
     "{"
         "\"deviceId\":\"%s\","
@@ -869,6 +886,7 @@ static int build_battery_json(char *payload, size_t payload_sz)
         "\"chargingStatus\":\"%s\","
         "\"alerts\":[]"
         "%s"
+        "%s"
     "}",
         device_get_id(),
         ts_ms,
@@ -879,7 +897,8 @@ static int build_battery_json(char *payload, size_t payload_sz)
         cycleCount,
         estimatedRangeKm,
         chargingStatus,
-        gps_part);
+        gps_part,
+        track_part);
     return n;
 }
 
@@ -1123,7 +1142,16 @@ static void enter_deep_sleep_cycle(uint32_t seconds)
     /* 加速度计挂在 3V3_ALWAYS_ON 上，MCU 睡了它不会跟着睡。
      * 必须显式写 power-down，否则高分辨率 100 Hz 会一直吃 ~185 µA
      * （电池侧约 360 µA，比整机其余底噪加起来还多）。 */
+#if ENABLE_TRACKING_POLICY
+    /* 阶段一：不再 power-down，而是切到 10 Hz 低功耗 + 锁存中断（约 3 µA）。
+     * 这样下一轮醒来能拿到「整个睡眠窗口动过没有」这一个 bit。 */
+    if (!motion_arm_for_sleep()) {
+        ESP_LOGW("SLEEP", "加速度计布防失败，退回 power-down（本轮锁存位不可用）");
+        motion_sensor_power_down();
+    }
+#else
     motion_sensor_power_down();
+#endif
 
     // 锁住 RTC GPIO 的电平（GNSS 供电必须保持，围栏引脚必须保持低）
     deep_sleep_prepare_pins();
@@ -1163,27 +1191,88 @@ void gps_mqtt_cycle_task(void* pv)
     ESP_LOGI("GPS", "gps_mqtt_cycle_task started: sleep=%d min, fix timeout=%d s, mqtt retries=%d",
              GPS_CYCLE_SLEEP_MIN, GPS_FIX_TIMEOUT_SEC, MQTT_SEND_MAX_RETRY);
 
+#if ENABLE_TRACKING_POLICY
+    ESP_LOGI("TRACK", "运动驱动已启用：每 %d s 醒一次读锁存，动作门限 平均帧差 %d mg/%d ms，"
+                      "只有判定为「有动作」才唤醒 GNSS（定位超时 %d s）",
+             TRACK_CYCLE_SEC, MOTION_MEAN_DELTA_TH_MG, MOTION_WINDOW_MS, TRACK_FIX_TIMEOUT_S);
+#endif
+
     while (1) {
-        // 1) 启动 GNSS。若本次是从 deep sleep 醒来，模组还在 Backup 里，
-        //    必须用 RESET_N 脉冲叫醒它（Backup 只能硬件复位唤醒）。
         bool powered_modem = false;
+
+        /* ---- 1) 运动判定 ----
+         * 必须放在唤醒 GNSS 之前：GNSS 现在还在 Backup（µA 级），
+         * 判定为无动作就直接回去睡，连 RESET_N 唤醒那 770 ms 都省掉。 */
+#if ENABLE_TRACKING_POLICY
+        track_input_t  ti = { .latched = true, .activity_mg = -1 };
+        ti.latched = motion_read_and_clear_latch();
+        if (ti.latched) {
+            ti.activity_mg = motion_activity_mg(MOTION_WINDOW_MS, NULL, NULL);
+        } else {
+            ESP_LOGI("TRACK", "睡眠窗口全程静止，跳过 %d ms 采样", MOTION_WINDOW_MS);
+        }
+
+        track_output_t td = track_decide(ti);
+        uint32_t fix_timeout_s = td.fix_timeout_sec;
+        uint32_t next_sleep_s  = td.sleep_sec;
+
+        /* streak 只作诊断：连续静止了几轮（×30s 就是静止多久）。
+         * 原来显示成 streak=9/3 里的分母是 TRACK_NO_MOTION_STREAK，
+         * 那是「连续几轮静止就切 LOW 频率」的门槛 —— 取消双档后它已经不起作用，
+         * 带着分母只会让人误以为越过 3 就该停，所以去掉。
+         * doubt 的分母还留着，TRACK_DOUBT_MAX 是真的在用。 */
+        ESP_LOGW("TRACK", "第 %lu 轮｜锁存=%d 活动=%d mg -> %s%s｜已静止 %u 轮 doubt=%u/%d｜%s，下轮睡 %lus",
+                 (unsigned long)track_cycles(), (int)ti.latched, ti.activity_mg,
+                 track_event_str(td.event), td.cold_boot ? "(冷启动)" : "",
+                 td.streak, td.doubt, TRACK_DOUBT_MAX,
+                 td.do_gnss ? "开 GNSS 定位" : "不开 GNSS",
+                 (unsigned long)next_sleep_s);
+
+        if (!td.do_gnss) {
+            ESP_LOGI("GPS", "===== 无动作，跳过定位与上报，deep sleep %lu 秒 =====",
+                     (unsigned long)next_sleep_s);
+
+            /* 必须确保 GNSS 回到 Backup 再睡。
+             * 理论上它上一轮睡前就进 Backup 了、这一轮也没人唤醒它，
+             * 但开机时 gnss_init() 会重新配置 IO2(RESET_N) 和 UART2，
+             * 引脚方向切换的瞬间有可能给出一个复位脉冲把它叫醒 ——
+             * 一旦醒了又没人放回去，整个睡眠窗口就是满功率搜星（约 40 mA）。
+             * 已经在 Backup 时这条命令不会有副作用，报告里的
+             * 「发送前输出速率」会直接告诉我们它当时是醒是睡。 */
+            gnss_ensure_standby_fast();
+
+            modem_power_enable(false);
+#if ENABLE_DEEP_SLEEP
+            enter_deep_sleep_cycle(next_sleep_s);   /* 不返回 */
+#else
+            vTaskDelay(next_sleep_s * 1000 / portTICK_PERIOD_MS);
+#endif
+            continue;
+        }
+#else
+        uint32_t fix_timeout_s = (uint32_t)GPS_FIX_TIMEOUT_SEC;
+        uint32_t next_sleep_s  = (uint32_t)GPS_CYCLE_SLEEP_MIN * 60U;
+#endif
+
+        /* ---- 2) 有动作才走到这里：唤醒 GNSS ----
+         * 从 deep sleep 醒来时模组还在 Backup，只能用 RESET_N 脉冲叫醒。 */
         gnss_enable(true);
         gnss_reset_release();
 
-#if ENABLE_DEEP_SLEEP
-        esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
-        if (wc == ESP_SLEEP_WAKEUP_TIMER || wc == ESP_SLEEP_WAKEUP_EXT0) {
-            ESP_LOGI("GPS", "从 deep sleep 醒来，先把 GNSS 从 Backup 唤醒");
-            gnss_wake_from_standby2();
-        }
-#endif
+        /* 无论是深睡唤醒还是上电/复位，都无法知道 GNSS 当前是不是在 Backup：
+         * RAM 里的状态标志深睡会丢；而按复位或烧录时模组的电压根本没断，
+         * 它会一直保持在上一轮进的 Backup 里 —— 不发这个脉冲就永远没有 NMEA。
+         * 对已经在跑的模组，这个脉冲只是让它重启一次（约 770 ms），无害。
+         * 以前靠 gpio_init() 里 IO11 的毛刺「顺带」把它撞醒，那是 bug 不是设计。 */
+        ESP_LOGI("GPS", "确保 GNSS 脱离 Backup（RESET_N 脉冲）");
+        gnss_wake_from_standby2();
 
-        // 2) 连续模式下等待 GNSS 定位
+        // 3) 等待 GNSS 定位
         gnss_last_location.valid = false;
         gnss_reset_state_for_ttff();
-        ESP_LOGI("GPS", "Waiting GNSS fix (timeout %ds)...", GPS_FIX_TIMEOUT_SEC);
+        ESP_LOGI("GPS", "Waiting GNSS fix (timeout %lus)...", (unsigned long)fix_timeout_s);
         TickType_t t0 = xTaskGetTickCount();
-        while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(GPS_FIX_TIMEOUT_SEC * 1000)) {
+        while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(fix_timeout_s * 1000)) {
             if (gnss_last_location.valid) { break; }
             vTaskDelay(200 / portTICK_PERIOD_MS);
         }
@@ -1236,13 +1325,14 @@ void gps_mqtt_cycle_task(void* pv)
 
             bool pub_ok = publish_battery_payload();
             ESP_LOGI("BAT", "Publish %s", pub_ok ? "success" : "failed");
+            track_note_publish(pub_ok);
             seq_report(pub_ok ? "周期上报（成功）" : "周期上报（失败）");
 #if ENABLE_DEEP_SLEEP
             if (pub_ok) { app_note_publish_ok(); }
 #endif
             // 注意：锁要持有到第 4 步关掉模组之后再放
         } else {
-            ESP_LOGW("GPS", "No GNSS fix within %ds, skip EG800/MQTT and go to sleep", GPS_FIX_TIMEOUT_SEC);
+            ESP_LOGW("GPS", "No GNSS fix within %lus, skip EG800/MQTT and go to sleep", (unsigned long)fix_timeout_s);
         }
 #endif
 
@@ -1250,8 +1340,13 @@ void gps_mqtt_cycle_task(void* pv)
          *    GNSS -> Backup（VCC 保持，星历留存，热启动）
          *    模组 -> QPOWD 正常关机 + 断 3.8V 轨
          *    ESP32 -> deep sleep                                      */
-        ESP_LOGI("GPS", "===== 进入省电：GNSS Backup + 模组关机 + ESP deep sleep %d 分钟 =====",
-                 GPS_CYCLE_SLEEP_MIN);
+        ESP_LOGI("GPS", "===== 进入省电：GNSS Backup + 模组关机 + ESP deep sleep %lu 秒（mode=%s）=====",
+                 (unsigned long)next_sleep_s,
+#if ENABLE_TRACKING_POLICY
+                 track_mode_str(td.mode));
+#else
+                 "fixed");
+#endif
 
         gnss_enter_standby2();
 
@@ -1264,11 +1359,11 @@ void gps_mqtt_cycle_task(void* pv)
         }
 
 #if ENABLE_DEEP_SLEEP
-        enter_deep_sleep_cycle(GPS_CYCLE_SLEEP_MIN * 60U);
+        enter_deep_sleep_cycle(next_sleep_s);
         // enter_deep_sleep_cycle() 不返回，醒来是复位、从 app_main 重新开始
 #else
         // 不用 deep sleep 时退回原来的行为：任务级延时 + 唤醒 GNSS
-        vTaskDelay(GPS_CYCLE_SLEEP_MIN * 60 * 1000 / portTICK_PERIOD_MS);
+        vTaskDelay(next_sleep_s * 1000 / portTICK_PERIOD_MS);
         ESP_LOGI("GNSS_LP", "Wake GNSS from backup");
         gnss_wake_from_standby2();
 #endif

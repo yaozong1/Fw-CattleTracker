@@ -395,6 +395,29 @@ bool gnss_enable_ephemeris_save(void)
     return gnss_wait_quectel_ack(0x06, 0x10, GNSS_QBIN_ACK_TIMEOUT_MS);
 }
 
+bool gnss_ensure_standby_fast(void)
+{
+    /* 探测窗口：GNSS 在跑的时候是 26~56 句/秒，400 ms 能看到 10~22 句，
+     * 判「有没有在输出」绰绰有余。跳过轮次里我们从头到尾没碰过 GNSS，
+     * 它本该一直在 Backup —— 这里只是花 400 ms 把这件事确认掉，
+     * 而不是花 4 s 走完整的进 Backup 流程。 */
+    uint32_t pre = gnss_lines_seen;
+    vTaskDelay(pdMS_TO_TICKS(GNSS_STANDBY_PROBE_MS));
+    uint32_t n = gnss_lines_seen - pre;
+
+    if (n == 0) {
+        gnss_in_standby = true;
+        ESP_LOGI(TAG, "GNSS 探测 %d ms 无输出 -> 仍在 Backup，跳过 CFG-SLEEP",
+                 GNSS_STANDBY_PROBE_MS);
+        return true;
+    }
+
+    /* 它醒着 —— 不管为什么，必须放回 Backup，否则整个睡眠窗口 40 mA。 */
+    ESP_LOGW(TAG, "GNSS 探测到 %lu 句/%d ms -> 它是醒的，走完整流程放回 Backup",
+             (unsigned long)n, GNSS_STANDBY_PROBE_MS);
+    return gnss_enter_standby2();
+}
+
 bool gnss_enter_standby2(void)
 {
     gnss_in_standby = false;
@@ -1162,11 +1185,14 @@ void gnss_init(void)
     ESP_LOGI(TAG, "Pins set: TX=%d -> GNSS RXD, RX=%d <- GNSS TXD", GNSS_UART_TX, GNSS_UART_RX);
 
     // GNSS 使能脚（IO11 -> LP5907 EN）拉高
+    /* 先写电平锁存器再切方向：深睡唤醒等同复位，输出锁存器复位值是 0，
+     * 先 set_direction(OUTPUT) 会把 IO11 驱动成低，LP5907 当场关断，
+     * GNSS 掉电冷启动 —— Backup 和 RTC 全丢。 */
+    gnss_enable(true);                 // 先写锁存器
     gpio_set_direction(GNSS_EN_PIN, GPIO_MODE_OUTPUT);
-    gnss_enable(true);
     ESP_LOGI(TAG, "GNSS EN pin %d set HIGH", GNSS_EN_PIN);
     
     // GNSS 复位脚初始化
-    gpio_set_direction(GNSS_RST_PIN, GPIO_MODE_OUTPUT);
     gnss_reset_release(); // 释放复位状态
+    gpio_set_direction(GNSS_RST_PIN, GPIO_MODE_OUTPUT);
 }

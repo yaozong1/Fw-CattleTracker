@@ -10,6 +10,7 @@ idf_component_register(
               "gpio_module.c"
               "button_module.c"
               "timer_module.c"
+              "tracking_policy.c"
        INCLUDE_DIRS ""
 )
 

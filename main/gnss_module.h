@@ -57,6 +57,11 @@ void gnss_send_quectel_bin(uint8_t cls, uint8_t id, const uint8_t* payload, uint
 
 // GNSS低功耗管理
 bool gnss_enter_standby2(void);
+
+/* 跳过轮次专用：先探测 GNSS_STANDBY_PROBE_MS，确认模组没在输出就直接返回，
+ * 省掉 gnss_enter_standby2() 那套「1s 测速 + 发命令 + 2s 验证静默」（约 4 s）。
+ * 探测到还在输出，说明它不知怎么醒了 —— 退回走完整流程，不会漏放回 Backup。 */
+bool gnss_ensure_standby_fast(void);
 bool gnss_wake_from_standby2(void);
 bool gnss_enter_backup_via_cfg(void);
 void gnss_exit_backup_via_reset(void);

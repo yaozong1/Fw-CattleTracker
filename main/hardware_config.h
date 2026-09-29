@@ -420,6 +420,175 @@
 #define DEEPSLEEP_WAKE_ON_BUTTON 0
 #endif
 
+
+/* ================= 运动驱动的上报频率（阶段一） =================
+ * 机制：深睡时 LIS2DH12 以 10 Hz 低功耗跑着并锁存中断（约 3 µA）。
+ * 醒来先读一个 bit「整个睡眠窗口动过没有」，动过才花 5 秒采样数次数。
+ *
+ *   次数 >= 门限        -> 有动作：mode = HIGH，streak 清零
+ *   锁存位 = 0          -> 确定静止：streak++
+ *   锁存位 = 1 但次数不够 -> 存疑：streak 不变（连续存疑太多次才算静止）
+ *   streak >= 3         -> mode = LOW
+ *
+ * HIGH / LOW 只影响唤醒周期；两种模式下都照常定位，定到位就上报。 */
+
+#ifndef ENABLE_TRACKING_POLICY
+#define ENABLE_TRACKING_POLICY 1      // 0 = 退回原来的固定周期行为
+#endif
+
+/* 唤醒周期（分钟）。
+ * 测试期两者都设成 3，先验证状态机逻辑；验证完再拉开
+ * （计划：HIGH -> 1，LOW -> 15 或 30）。 */
+/* 固定唤醒周期（秒）。当前阶段不区分高低频：每 TRACK_CYCLE_SEC 醒一次，
+ * 读一次锁存位做判定，只有判定为「有动作」才唤醒 GNSS 去定位上报。 */
+/* ---- 醒着时长的压缩（静止轮次的功耗几乎全在这里）----
+ * 静止不动时每轮要醒 7.2 s 却什么都不做，占空比 24%，这是现在的功耗大头。
+ * 下面这些都是可调的延时上限；如果压得太短导致静止误判成"动过"，
+ * 或者 GNSS 没能回到 Backup（睡眠电流从 150 µA 跳到 40 mA），
+ * 把对应的值调回括号里的原值即可，不用改代码。 */
+
+/* 深睡唤醒时跳过 I2C 总线扫描（纯诊断，约 430 ms）。
+ * 设备识别由 lis2dh12_check_device_id() 独立完成，不依赖扫描。
+ * 置 1 则每轮都扫。 */
+#ifndef MOTION_I2C_SCAN_ON_WAKE
+#define MOTION_I2C_SCAN_ON_WAKE 0
+#endif
+
+/* 深睡唤醒时加速度计从未掉电，不需要再等稳定（原 200 ms） */
+#ifndef MOTION_INIT_SETTLE_MS
+#define MOTION_INIT_SETTLE_MS 200
+#endif
+
+/* 睡眠布防各段延时。SETTLE 是给高通滤波器收敛的，压太短会让
+ * 布防完立刻误锁存 —— 静止被判成"动过"就是这里出问题。（原 500 / 200 / 120） */
+#ifndef MOTION_ARM_SETTLE_MS
+#define MOTION_ARM_SETTLE_MS 300
+#endif
+#ifndef MOTION_ARM_REF_WAIT_MS
+#define MOTION_ARM_REF_WAIT_MS 120
+#endif
+#ifndef MOTION_ARM_CLEAR_STEP_MS
+#define MOTION_ARM_CLEAR_STEP_MS 100
+#endif
+
+/* 跳过轮次确认 GNSS 是否还在 Backup 的探测窗口。
+ * GNSS 醒着时是 26~56 句/秒，400 ms 能看到 10~22 句，足够判定。
+ * 探测到 0 句就认为仍在 Backup，跳过整套 CFG-SLEEP 流程（省约 4 s）。 */
+#ifndef GNSS_STANDBY_PROBE_MS
+#define GNSS_STANDBY_PROBE_MS 400
+#endif
+
+#ifndef TRACK_CYCLE_SEC
+#define TRACK_CYCLE_SEC 30
+#endif
+#ifndef TRACK_FIX_TIMEOUT_S
+#define TRACK_FIX_TIMEOUT_S 90
+#endif
+
+/* 下面这两组是 HIGH/LOW 双档用的，当前被 TRACK_CYCLE_SEC 取代，
+ * 逻辑还在 tracking_policy.c 里（streak/doubt 照常维护），只是不再影响周期。 */
+#ifndef TRACK_HIGH_PERIOD_MIN
+#define TRACK_HIGH_PERIOD_MIN 1
+#endif
+#ifndef TRACK_LOW_PERIOD_MIN
+#define TRACK_LOW_PERIOD_MIN  1
+#endif
+
+/* 定位超时（秒） */
+#ifndef TRACK_FIX_TIMEOUT_HIGH_S
+#define TRACK_FIX_TIMEOUT_HIGH_S 90
+#endif
+#ifndef TRACK_FIX_TIMEOUT_LOW_S
+#define TRACK_FIX_TIMEOUT_LOW_S  90
+#endif
+
+/* ---- 醒着时的 5 秒采样窗口 ---- */
+#ifndef MOTION_WINDOW_MS
+#define MOTION_WINDOW_MS 5000
+#endif
+/* 主判据的门限：相邻两个采样点的加速度矢量差 ‖a[n] − a[n-1]‖ 超过这个值，
+ * 这一帧算「在动」。单位 mg，采样间隔 MOTION_SAMPLE_PERIOD_MS。
+ *
+ * 为什么用「相邻帧差」而不是「模长偏离 1g」：
+ *   ‖a‖ 是旋转不变量。板子绕轴翻转/摇晃时重力只是在三个轴之间重新分配，
+ *   模长始终 ≈1 g，|‖a‖−1g| 几乎为 0 —— 用力晃动实测峰值只有 206 mg、
+ *   活动占比 4%，完全漏判。牛低头/甩头/走路同样以旋转为主。
+ *   帧差把姿态变化也算进来，旋转和平移都抓得到。
+ *
+ * 量级参考（50 Hz 采样）：静止噪声 <10 mg，手持慢晃 100~400 mg，
+ * 用力摇 500 mg 以上。60 mg 是起点，现场标定。 */
+#ifndef MOTION_DELTA_TH_MG
+#define MOTION_DELTA_TH_MG 60
+#endif
+
+/* 主判据：5 秒窗口内帧差的【平均值】(mg)。超过这个值判为「有动作」。
+ *
+ * 为什么不用「超阈值样本占比」：占比丢掉了幅度信息，而且帧差的能量集中在
+ * 运动换向的瞬间 —— 用力晃动实测占比也只有 19%，逐秒 22/14/18/26/18 很均匀，
+ * 说明不是断断续续，而是这个统计量本身的上限就在 20% 附近。
+ * 用平均帧差就没有这个问题：它对幅度和持续时间都单调，一个阈值就够。
+ *
+ * 量级参考（50 Hz 采样、HR 模式）：
+ *   传感器噪声底 ~4 mg（静止时就是这个数，不是 0）
+ *   轻微摇头/碰一下   10~15 mg
+ *   手持用力晃动      20~40 mg
+ * 标定方法：静止跑一轮记下平均值 a，真实运动跑一轮记下 b，取 sqrt(a*b)。 */
+#ifndef MOTION_MEAN_DELTA_TH_MG
+#define MOTION_MEAN_DELTA_TH_MG 20
+#endif
+/* 旧判据 |‖a‖ − 1g| 的门限，现在只用于日志里的对照输出，不参与判定。 */
+#ifndef MOTION_EVENT_TH_MG
+#define MOTION_EVENT_TH_MG 120
+#endif
+/* 去抖：两次计数之间至少间隔这么久。200 ms 等于上限 5 Hz，
+ * 高于任何真实步频，防止一次晃动被数成好几次。 */
+#ifndef MOTION_EVENT_DEBOUNCE_MS
+#define MOTION_EVENT_DEBOUNCE_MS 200
+#endif
+/* 「有动作」的主判据：5 秒窗口里超过阈值的样本占比（%）。
+ * 换掉原来的「上升沿次数」—— 那个判据靠迟滞复位，持续晃动时信号一直
+ * 待在迟滞下沿之上，above 永不复位，整段晃动只数到 1 次。
+ * 占比天生区分「持续 vs 瞬态」，不需要靠去抖和迟滞去凑：
+ *   持续走路/晃动 60~90%  |  摇头、敲一下 5~15%  |  静止 0%
+ * 现场标定就调这个值。 */
+#ifndef MOTION_ACTIVE_PCT_THRESHOLD
+#define MOTION_ACTIVE_PCT_THRESHOLD 30
+#endif
+
+/* 采样间隔。传感器 ODR 开到 100 Hz、这里每 20 ms 取一次，
+ * 保证每次读到的都是新样本（帧差判据下读到重复样本会被算成「没动」）。
+ * 5 秒窗口 = 250 个点。 */
+#ifndef MOTION_SAMPLE_PERIOD_MS
+#define MOTION_SAMPLE_PERIOD_MS 20
+#endif
+
+/* 上升沿次数只作诊断输出，不再参与判定（保留是为了和历史日志对照） */
+#ifndef MOTION_COUNT_THRESHOLD
+#define MOTION_COUNT_THRESHOLD 5
+#endif
+
+/* ---- 深睡布防（锁存中断）---- */
+/* 锁存阈值要比上面的事件阈值更灵敏 —— 它只负责回答「有没有动过」，
+ * 宁可多锁存（进入存疑分支再采样确认），也不要漏。
+ * ±2g 量程下 INT1_THS 是 16 mg/LSB，96 mg -> THS = 6。 */
+#ifndef MOTION_LATCH_THS_MG
+#define MOTION_LATCH_THS_MG 96
+#endif
+/* 0 = 任何一次超阈值立刻锁存。1 LSB = 1/ODR = 100 ms @10Hz。 */
+#ifndef MOTION_LATCH_DUR_MS
+#define MOTION_LATCH_DUR_MS 0
+#endif
+
+/* ---- 状态机 ---- */
+#ifndef TRACK_NO_MOTION_STREAK
+#define TRACK_NO_MOTION_STREAK 3      // 连续几轮无动作退回 LOW
+#endif
+/* 连续这么多轮「存疑」（锁存说动过但次数不够）也当作一轮静止。
+ * 没有这个上限的话，一头每轮都甩一下头的牛会永远卡在 HIGH。 */
+#ifndef TRACK_DOUBT_MAX
+#define TRACK_DOUBT_MAX 5
+#endif
+
 /* ---------------- 模组开机 / 联网时序 ----------------
  * 下面这些是**超时上限**，不是固定等待。
  * 原来的代码里有一堆 vTaskDelay 盲等（开机后 2 s、清 URC 3 s、"等模组稳定" 3 s），

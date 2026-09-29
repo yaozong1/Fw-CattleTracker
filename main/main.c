@@ -17,6 +17,7 @@
 #include "esp_sleep.h"
 #include "driver/gpio.h"
 #include "eg915_selftest.h"
+#include "tracking_policy.h"
 
 static const char *TAG = "APP";
 
@@ -83,6 +84,10 @@ void app_main(void)
         }
         ESP_LOGI(TAG, " 历史统计：定位成功 %lu 次，上报成功 %lu 次",
                  (unsigned long)s_fix_ok_count, (unsigned long)s_pub_ok_count);
+#if ENABLE_TRACKING_POLICY
+        ESP_LOGI(TAG, " 频率策略：已跑 %lu 轮，成功上报 %lu 次",
+                 (unsigned long)track_cycles(), (unsigned long)track_publishes());
+#endif
         ESP_LOGI(TAG, "==================================================");
 
         // 解除 deep sleep 期间的引脚保持，否则后面 gpio_set_level 写不进去
@@ -124,7 +129,13 @@ void app_main(void)
     // 6. 初始化运动传感器
     if (motion_sensor_init()) {
         ESP_LOGI(TAG, "Motion sensor initialized successfully!");
+#if ENABLE_TRACKING_POLICY
+        /* 启用运动驱动频率时不起这个轮询任务：它会和每轮唤醒的 5 秒采样
+         * 抢同一条 I2C 总线，而且采样窗口本身已经覆盖了它的功能。 */
+        ESP_LOGI(TAG, "运动驱动频率已启用，不启动 motion_sensor_task（避免 I2C 争用）");
+#else
         xTaskCreate(motion_sensor_task, "motion_task", 4096, NULL, 5, NULL);
+#endif
     } else {
         ESP_LOGE(TAG, "Motion sensor initialization failed - continuing without it");
     }

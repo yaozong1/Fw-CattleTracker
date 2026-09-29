@@ -52,10 +52,16 @@ void gpio_init(void)
     gpio_pullup_dis(MODEM_STATUS_PIN);
     gpio_pulldown_dis(MODEM_STATUS_PIN);
 
-    /* ---- GNSS ---- */
+    /* ---- GNSS ----
+     * 顺序很关键：必须【先写电平、再切方向】。
+     * 深睡唤醒等同芯片复位，GPIO 输出锁存器复位值是 0；如果先 set_direction(OUTPUT)，
+     * IO11 会被驱动成低电平，LP5907 当场关断 —— GNSS 掉电冷启动，
+     * Backup 状态和 RTC 时间全丢，唤醒后一直在满功率搜星（约 40 mA）。 */
+    gpio_set_level(GNSS_EN_PIN, 1);             // 先把输出锁存器写成 1
     gpio_set_direction(GNSS_EN_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_direction(GNSS_RST_PIN, GPIO_MODE_OUTPUT);
+
     gpio_set_level(GNSS_RST_PIN, 0);            // 反相驱动，0 = 释放复位
+    gpio_set_direction(GNSS_RST_PIN, GPIO_MODE_OUTPUT);
 
     gpio_set_direction(GNSS_PPS_PIN, GPIO_MODE_INPUT);
     gpio_set_direction(GNSS_3DFIX_PIN, GPIO_MODE_INPUT);
