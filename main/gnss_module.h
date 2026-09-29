@@ -69,6 +69,7 @@ void gnss_parse_and_log_gga(const char* nmea);
 void gnss_parse_and_log_gsa(const char* nmea);
 
 // GNSS任务
+void gnss_task_stop_request(void);   // 让 gnss_task 自行退出（调试保持模式）
 void gnss_task(void* pv);
 
 // GNSS初始化

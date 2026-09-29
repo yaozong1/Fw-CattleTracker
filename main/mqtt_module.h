@@ -38,6 +38,9 @@ bool device_id_is_imei(void);
 // 拼出 fleet/<deviceId>/<suffix>，deviceId 取自 IMEI
 void mqtt_build_topic(char *out, size_t out_sz, const char *suffix);
 
+// 读信号强度：返回 dBm（拿不到返回 0），raw_rssi 回填原始 CSQ 值（99=无信号）
+int modem_get_csq_dbm(int *raw_rssi);
+
 // AT命令函数
 void send_at_command(const char* command);
 bool wait_for_ok(uint32_t timeout_ms);
@@ -61,6 +64,11 @@ void app_note_publish_ok(void);
 // 手动上报：不管有没有 GNSS 定位都发一条当前 payload。
 // 立即返回，实际工作在独立的一次性任务里完成。
 void mqtt_manual_publish_request(void);
+
+/* 模组调试保持模式：开机之后 ESP32 不再碰模组，交给 USB 侧调试。
+ * 只能靠复位退出。 */
+void mqtt_modem_debug_hold(void);
+bool modem_debug_hold_active(void);
 
 // 业务功能函数
 bool publish_gps_payload(void);

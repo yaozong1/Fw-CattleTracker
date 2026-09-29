@@ -44,7 +44,14 @@ void app_main(void)
     xTaskCreate(Selftest_task, "selftest_task", 4096, NULL, 10, NULL);
     ESP_LOGI(TAG, "Self-test task created: selftest_task (SELFTEST=1)");
 
-    // IO0 双击 -> 打开围栏供电轨（自测模式下也可用）
+#if BUTTON_DBLCLICK_MQTT_PUBLISH
+    /* 双击要发 MQTT，得先有 UART1 和模组总线锁。
+     * mqtt_init() 是幂等的，自测任务里再调一次无妨。 */
+    mqtt_init();
+    ESP_LOGW(TAG, "自测模式：双击 IO0 = 联网发送 MQTT（不是围栏测试）");
+#endif
+
+    // IO0 双击 -> 按 BUTTON_DBLCLICK_* 决定动作
     button_module_start();
     while (1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);

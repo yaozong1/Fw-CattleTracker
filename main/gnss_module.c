@@ -887,6 +887,10 @@ void gnss_parse_and_log_gsa(const char* nmea)
     gnss_report_ttff_if_needed();
 }
 
+/* 置位后 gnss_task 自行退出。调试保持模式用：ESP32 要彻底安静下来。 */
+static volatile bool s_gnss_stop = false;
+void gnss_task_stop_request(void) { s_gnss_stop = true; }
+
 void gnss_task(void* pv)
 {
     // 读 GNSS NMEA 数据并打印，优先显示 RMC
@@ -916,6 +920,11 @@ void gnss_task(void* pv)
     uint8_t q_c1=0, q_c2=0, q_rx_c1=0; uint8_t q_buf[64];
 
     while (1) {
+        if (s_gnss_stop) {
+            ESP_LOGW(TAG, "gnss_task 收到停止请求，退出（调试保持模式）");
+            vTaskDelete(NULL);
+            return;
+        }
         if (gnss_should_stop) {
             ESP_LOGI(TAG, "Stopping GNSS receiver after benchmark");
             vTaskDelete(NULL);

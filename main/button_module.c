@@ -2,6 +2,7 @@
 #include "hardware_config.h"
 #include "gpio_module.h"
 #include "mqtt_module.h"
+#include "gnss_module.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -83,6 +84,10 @@ static void button_task(void *pv)
 #else
     ESP_LOGI(TAG, "Button task started on IO%d (double-click -> no action configured)", BUTTON_PIN);
 #endif
+#if BUTTON_LONGPRESS_MODEM_DEBUG
+    ESP_LOGI(TAG, "  长按 %d ms -> 模组调试保持模式（开机后交给 USB 调试）",
+             BUTTON_LONGPRESS_MS);
+#endif
 
     while (1) {
         // --- 等待第一次按下 ---
@@ -100,13 +105,21 @@ static void button_task(void *pv)
         bool released = wait_level(false, BUTTON_LONGPRESS_MS, &held);
 
         if (!released) {
-#if BUTTON_LONGPRESS_OFF
+#if BUTTON_LONGPRESS_MODEM_DEBUG
+            /* 长按：进入模组调试保持模式。
+             * 把模组开起来之后 ESP32 就彻底不碰它了，交给 USB 侧调试。
+             * 只能靠复位退出。 */
+            ESP_LOGW(TAG, "Long press -> 进入模组调试保持模式");
+            led_blink(LED_ESP_PIN, 3, 150, 150);
+            gnss_task_stop_request();     // GNSS 也停掉，ESP32 彻底安静
+            mqtt_modem_debug_hold();
+#elif BUTTON_LONGPRESS_OFF
             // 长按：回到安全状态
             fence_rails_enable(false);
             ESP_LOGI(TAG, "Long press: fence rails back to SAFE (both LOW)");
             led_blink(LED_ESP_PIN, 1, 600, 200);
 #else
-            ESP_LOGI(TAG, "Long press ignored (BUTTON_LONGPRESS_OFF=0)");
+            ESP_LOGI(TAG, "Long press ignored");
 #endif
             // 等按键真正松开再继续，避免重复触发
             while (btn_down()) {

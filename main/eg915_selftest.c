@@ -32,9 +32,18 @@ static const char *TAG_ST = "SELFTEST";
 #define SELFTEST_VBAT_MIN 3.00f
 #define SELFTEST_VBAT_MAX 4.30f
 
+/* 自测阶段是否给模组上电。
+ * 双击 IO0 = 联网发 MQTT 时设为 0：自测全程不碰 3.8V 轨和 PWRKEY，
+ * 让双击那一刻从"模组完全没开"开始，时序打点才量得到真实开机耗时，
+ * 也才和深睡唤醒后的实际情况一致。 */
+#ifndef SELFTEST_POWER_MODEM
+#  define SELFTEST_POWER_MODEM (!BUTTON_DBLCLICK_MQTT_PUBLISH)
+#endif
+
 typedef struct {
     // Modem (EG800)
     bool modem_ok;
+    bool modem_skipped;      // 本轮自测没给模组上电，EG800/SIM 两项不参与判定
     bool modem_status_pin;
     char modem_imei[32];
     char modem_iccid[32];
@@ -279,13 +288,16 @@ static void build_json(const selftest_report_t *r, char *out, size_t out_sz)
 
 static bool overall_pass(const selftest_report_t *r)
 {
-    return r->modem_ok && r->motion_ok && r->gnss_uart_ok && r->battery_ok && r->fence_safe;
+    // 跳过模组这轮时，EG800/SIM 不参与总判定
+    bool modem_part = r->modem_skipped ? true : r->modem_ok;
+    return modem_part && r->motion_ok && r->gnss_uart_ok && r->battery_ok && r->fence_safe;
 }
 
 static void print_human_summary(const selftest_report_t *r)
 {
     ESP_LOGI(TAG_ST, "================= SELFTEST RESULT =================");
-    ESP_LOGI(TAG_ST, "EG800 (AT)  : %s (IMEI=%s)", r->modem_ok ? "PASS" : "FAIL", r->modem_imei);
+    ESP_LOGI(TAG_ST, "EG800 (AT)  : %s (IMEI=%s)",
+             r->modem_skipped ? "SKIP" : (r->modem_ok ? "PASS" : "FAIL"), r->modem_imei);
     ESP_LOGI(TAG_ST, "SIM/ICCID   : %s", r->modem_iccid);
     ESP_LOGI(TAG_ST, "Motion      : %s (|a|=%.3fg)", r->motion_ok ? "PASS" : "FAIL", r->motion_mag);
     ESP_LOGI(TAG_ST, "GNSS UART   : %s (bytes=%d, 3D_FIX=%d)", r->gnss_uart_ok ? "PASS" : "FAIL",
@@ -309,9 +321,12 @@ static void print_formatted_result(const selftest_report_t *r)
     ESP_LOGI(TAG_ST, "+--------------------+---------+--------------------------------+");
     ESP_LOGI(TAG_ST, "| Test Item          | Result  | Details                        |");
     ESP_LOGI(TAG_ST, "+--------------------+---------+--------------------------------+");
-    ESP_LOGI(TAG_ST, "| EG800 Module       | %-7s | IMEI %s", r->modem_ok ? "PASS" : "FAIL", r->modem_imei);
+    ESP_LOGI(TAG_ST, "| EG800 Module       | %-7s | IMEI %s",
+             r->modem_skipped ? "SKIP" : (r->modem_ok ? "PASS" : "FAIL"), r->modem_imei);
     ESP_LOGI(TAG_ST, "| SIM Card           | %-7s | ICCID %s",
-             (strcmp(r->modem_iccid, "N/A") != 0) ? "PASS" : "FAIL", r->modem_iccid);
+             r->modem_skipped ? "SKIP"
+                              : ((strcmp(r->modem_iccid, "N/A") != 0) ? "PASS" : "FAIL"),
+             r->modem_iccid);
     ESP_LOGI(TAG_ST, "| Motion Sensor      | %-7s | Magnitude: %.3f g", r->motion_ok ? "PASS" : "FAIL", r->motion_mag);
     ESP_LOGI(TAG_ST, "| GNSS UART          | %-7s | %d bytes, 3D_FIX=%d", r->gnss_uart_ok ? "PASS" : "FAIL",
              r->gnss_bytes, r->gnss_3dfix);
@@ -325,7 +340,8 @@ static void print_formatted_result(const selftest_report_t *r)
 
     if (!overall) {
         ESP_LOGI(TAG_ST, "--- FAILURE DETAILS ---");
-        if (!r->modem_ok)     ESP_LOGI(TAG_ST, "  x EG800: no AT response - check 3.8V rail / PWRKEY / UART1");
+        if (!r->modem_ok && !r->modem_skipped)
+            ESP_LOGI(TAG_ST, "  x EG800: no AT response - check 3.8V rail / PWRKEY / UART1");
         if (!r->motion_ok)    ESP_LOGI(TAG_ST, "  x Motion: read failed - check I2C (IO14/IO15)");
         if (!r->gnss_uart_ok) ESP_LOGI(TAG_ST, "  x GNSS: no data - check LP5907 EN (IO11) / UART2 (IO6,IO7)");
         if (!r->battery_ok)   ESP_LOGI(TAG_ST, "  x Battery: out of range - check R93/R94 divider on IO1");
@@ -447,10 +463,12 @@ void Selftest_task(void *pv)
     // 0. 围栏引脚先进入安全状态（涉及高压，优先级最高）
     selftest_fence(&rep);
 
-    // 1. 模组供电与串口
+    // 1. 模组串口（mqtt_init 只建 UART1 和总线锁，不碰 3.8V 轨）
+    mqtt_init();
+
+#if SELFTEST_POWER_MODEM
     modem_power_enable(true);
     vTaskDelay(pdMS_TO_TICKS(200));
-    mqtt_init();
 
     rep.modem_status_pin = modem_is_powered();
     if (!rep.modem_status_pin) {
@@ -473,6 +491,21 @@ void Selftest_task(void *pv)
         strcpy(rep.modem_imei, "N/A");
         strcpy(rep.modem_iccid, "N/A");
     }
+#else
+    /* 自测不给模组上电：3.8V 轨保持关闭，PWRKEY 不动。
+     * 模组开机交给双击 IO0 那条路径，这样每次双击都是真正的冷启动。 */
+    modem_power_enable(false);
+    rep.modem_skipped    = true;
+    rep.modem_ok         = false;
+    rep.modem_status_pin = modem_is_powered();
+    strcpy(rep.modem_imei,  "SKIP");
+    strcpy(rep.modem_iccid, "SKIP");
+    ESP_LOGW(TAG_ST, "EG800/SIM 本轮跳过：自测不上电，双击 IO0 时才开机（冷启动计时）");
+
+    /* 这几个只在上电分支里用，这里取一下地址避免 -Wunused-function */
+    (void)drain_boot_urcs; (void)eg915_at_handshake_once;
+    (void)modem_get_imei;  (void)modem_get_iccid;
+#endif
 
     selftest_motion(&rep);
     selftest_battery(&rep);

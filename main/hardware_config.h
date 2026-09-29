@@ -53,15 +53,30 @@
 #define SELFTEST 0
 #endif
 
-/* ---- IO0 双击的动作，两种模式互补 ----
- *   SELFTEST=1 → 打开围栏供电轨 + Trig 方波（可控硅测试），不发 MQTT
- *   SELFTEST=0 → 手动向 MQTT 发一条 payload，完全不碰可控硅
- * 想要别的组合就显式覆盖这两个宏（同时置 1 也能编，两件事会依次做）。 */
+/* ---- IO0 双击的动作 ----
+ *   业务模式 (SELFTEST=0) → 手动向 MQTT 发一条 payload，完全不碰可控硅
+ *   自测模式 (SELFTEST=1) → 由 SELFTEST_DBLCLICK_MQTT 决定：
+ *        1 = 联网发一条 MQTT（用来在台面上验证模组联网和上报）
+ *        0 = 打开围栏供电轨 + Trig 方波（可控硅测试）
+ * 想要别的组合就显式覆盖下面两个宏（同时置 1 也能编，两件事会依次做）。 */
+#ifndef SELFTEST_DBLCLICK_MQTT
+#define SELFTEST_DBLCLICK_MQTT 1
+#endif
+
 #ifndef BUTTON_DBLCLICK_FENCE_TEST
-#define BUTTON_DBLCLICK_FENCE_TEST SELFTEST
+#define BUTTON_DBLCLICK_FENCE_TEST   (SELFTEST && !SELFTEST_DBLCLICK_MQTT)
 #endif
 #ifndef BUTTON_DBLCLICK_MQTT_PUBLISH
-#define BUTTON_DBLCLICK_MQTT_PUBLISH (!SELFTEST)
+#define BUTTON_DBLCLICK_MQTT_PUBLISH (!SELFTEST || SELFTEST_DBLCLICK_MQTT)
+#endif
+
+/* 长按 IO0 的动作。
+ *   1 = 进入模组调试保持模式：把模组开起来之后 ESP32 彻底不碰它
+ *       （不发 AT、不 power cycle、不 CFUN=0、不断轨），交给模组自己的
+ *       USB 口去调试。只能靠复位退出。自测模式下默认打开。
+ *   0 = 保持原行为，看 BUTTON_LONGPRESS_OFF（长按把围栏供电轨关回安全态）*/
+#ifndef BUTTON_LONGPRESS_MODEM_DEBUG
+#define BUTTON_LONGPRESS_MODEM_DEBUG SELFTEST
 #endif
 
 // 围栏动作里是否包含 Trig 方波（0 = 只开供电轨，不触发可控硅）
@@ -403,6 +418,51 @@
  *   替代方案：不挂按键唤醒，靠定时器醒来后在等定位阶段双击 IO0 手动上报。 */
 #ifndef DEEPSLEEP_WAKE_ON_BUTTON
 #define DEEPSLEEP_WAKE_ON_BUTTON 0
+#endif
+
+/* ---------------- 模组开机 / 联网时序 ----------------
+ * 下面这些是**超时上限**，不是固定等待。
+ * 原来的代码里有一堆 vTaskDelay 盲等（开机后 2 s、清 URC 3 s、"等模组稳定" 3 s），
+ * 现在全部换成等事件：等 RDY、等 AT 回 OK、轮询 CPIN/CEREG 直到就绪。
+ * 正常情况下远远用不到这些上限。 */
+
+/* PWRKEY 脉冲宽度。
+ * 实测结论（本板 EG800，rail-on 到 RDY 的总时间固定约 2.29 s）：
+ *   脉冲 2000 ms -> 释放后 290 ms 收到 RDY，模组开机段合计 2490 ms
+ *   脉冲 1000 ms -> 释放后 1290 ms 收到 RDY，模组开机段合计 2490 ms
+ *   脉冲  600 ms -> 开不了机
+ * 即 RDY 的时刻由 PWRKEY 的【下降沿】决定，与脉冲宽度无关，
+ * 缩短脉冲一秒也省不下来。所以这里取回 2000 ms —— 时间代价为零，
+ * 离 600 ms 那个失败点的余量最大。不要再为了'省时间'调小它。 */
+#ifndef MODEM_PWRKEY_PULSE_MS
+#define MODEM_PWRKEY_PULSE_MS 2000
+#endif
+#ifndef MODEM_PWRKEY_PULSE_RETRY_MS
+#define MODEM_PWRKEY_PULSE_RETRY_MS 2000
+#endif
+// 脉冲之后等模组吐 "RDY"（取代原来盲等 2 秒）；等不到也不致命，后面 AT 轮询兜底
+#ifndef MODEM_BOOT_RDY_TIMEOUT_MS
+#define MODEM_BOOT_RDY_TIMEOUT_MS 8000
+#endif
+// 清开机 URC：连续静默这么久就认为模组说完了（取代原来死等 3000 ms）
+#ifndef MODEM_DRAIN_QUIET_MS
+#define MODEM_DRAIN_QUIET_MS 300
+#endif
+#ifndef MODEM_DRAIN_MAX_MS
+#define MODEM_DRAIN_MAX_MS 3000
+#endif
+// 反复发 AT 等模组应答的上限（取代原来 5 次握手 + 盲等 3 秒"让模组稳定"）
+#ifndef MODEM_AT_READY_TIMEOUT_MS
+#define MODEM_AT_READY_TIMEOUT_MS 10000
+#endif
+// 轮询 AT+CPIN? 等 SIM 就绪的上限
+#ifndef MODEM_SIM_TIMEOUT_MS
+#define MODEM_SIM_TIMEOUT_MS 8000
+#endif
+/* 轮询 AT+CEREG? 等注册上网的上限。
+ * 原代码没有这一步，没注上网就直接发 CGACT，会一路卡到 CGACT 的 30 秒超时。 */
+#ifndef MODEM_REG_TIMEOUT_MS
+#define MODEM_REG_TIMEOUT_MS 60000
 #endif
 
 // 等 AT+QPOWD 回 "POWERED DOWN" 的超时

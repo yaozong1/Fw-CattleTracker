@@ -48,6 +48,10 @@ static bool mqtt_session_open = false;
 // 简单的串口读互斥，避免URC轮询与同步等待抢读
 static volatile bool uart_read_busy = false;
 
+/* 调试保持模式：长按 IO0 进入之后，ESP32 不再对模组发任何 AT。
+ * 定义在这里是因为 mqtt_poll_urc() 和 manual_publish_task() 都要看它。 */
+static volatile bool s_modem_debug_hold = false;
+
 // 外部依赖的ADC变量（需要从外部提供）
 extern esp_adc_cal_characteristics_t *adc_chars;
 
@@ -153,25 +157,48 @@ int uart_read_response(char* buffer, int max_len, int timeout_ms)
         ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_EG800_NUM, (size_t*)&bytes_available));
         
         if (bytes_available > 0) {
-            int len = uart_read_bytes(UART_EG800_NUM, (uint8_t*)buffer + total_len, 
-                                     max_len - total_len - 1, 50 / portTICK_PERIOD_MS);
+            /* 只取"已经在缓冲区里"的字节，超时给 0。
+             * 原来请求 max_len(≈500) 字节、超时 50ms —— 永远凑不满 500 字节，
+             * 所以每次都实打实阻塞满 50ms。这是每条 AT 固定开销的一半来源。 */
+            int want = bytes_available;
+            if (want > max_len - total_len - 1) want = max_len - total_len - 1;
+            int len = (want > 0) ? uart_read_bytes(UART_EG800_NUM,
+                                                   (uint8_t*)buffer + total_len,
+                                                   want, 0) : 0;
             if (len > 0) {
                 total_len += len;
                 buffer[total_len] = '\0';
-                
+
                 // 如果收到完整的响应（包含\r\n），提前返回
                 if (strstr(buffer, "\r\n") || strstr(buffer, "OK") || strstr(buffer, "ERROR")) {
-                    // 继续读取一小段时间，确保完整接收
-                    vTaskDelay(100 / portTICK_PERIOD_MS);
-                    
-                    ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_EG800_NUM, (size_t*)&bytes_available));
-                    if (bytes_available > 0) {
-                        len = uart_read_bytes(UART_EG800_NUM, (uint8_t*)buffer + total_len, 
-                                             max_len - total_len - 1, 50 / portTICK_PERIOD_MS);
-                        if (len > 0) {
-                            total_len += len;
-                            buffer[total_len] = '\0';
+                    /* 收尾：把紧跟其后的内容（回显之后的 OK、OK 之后的 URC）一起收进来。
+                     * 原来是硬等 100ms 再读一次 —— 另一半固定开销。
+                     * 现在 10ms 一格地查，连续 TAIL_QUIET_MS 没有新字节就收尾，
+                     * 上限仍是 TAIL_MAX_MS，语义不变，只是不等满。 */
+                    const int TAIL_STEP_MS  = 10;
+                    const int TAIL_MAX_MS   = 100;
+                    const int TAIL_QUIET_MS = 20;
+                    int waited = 0, quiet = 0;
+                    while (waited < TAIL_MAX_MS && quiet < TAIL_QUIET_MS
+                           && total_len < max_len - 1) {
+                        vTaskDelay(TAIL_STEP_MS / portTICK_PERIOD_MS);
+                        waited += TAIL_STEP_MS;
+                        ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_EG800_NUM,
+                                                                   (size_t*)&bytes_available));
+                        if (bytes_available > 0) {
+                            int w2 = bytes_available;
+                            if (w2 > max_len - total_len - 1) w2 = max_len - total_len - 1;
+                            int len2 = (w2 > 0) ? uart_read_bytes(UART_EG800_NUM,
+                                                                  (uint8_t*)buffer + total_len,
+                                                                  w2, 0) : 0;
+                            if (len2 > 0) {
+                                total_len += len2;
+                                buffer[total_len] = '\0';
+                                quiet = 0;          // 还有话说，重新计静默
+                                continue;
+                            }
                         }
+                        quiet += TAIL_STEP_MS;
                     }
                     break;
                 }
@@ -236,72 +263,232 @@ static bool wait_for_ok_then_contains(const char* expected_urc, uint32_t timeout
     return false;
 }
 
+/* ============ 开机/联网时序：等事件，不盲等 ============
+ * 这几个函数全部建立在现有的 send_at_command / wait_for_ok / uart_read_response
+ * 之上，不改 AT 收发内核。
+ * ====================================================== */
+
+/* 等 UART 静默。模组开机会连着吐 RDY / Call Ready / PB Done 等 URC，
+ * 与其死等固定秒数，不如等它自己说完：连续 quiet_ms 没新字节就返回。 */
+static void drain_until_quiet(uint32_t quiet_ms, uint32_t max_ms)
+{
+    char buf[256];
+    TickType_t t0 = xTaskGetTickCount();
+    TickType_t last_rx = t0;
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(max_ms)) {
+        int len = uart_read_bytes(UART_EG800_NUM, (uint8_t*)buf, sizeof(buf) - 1,
+                                  pdMS_TO_TICKS(20));
+        if (len > 0) {
+            buf[len] = '\0';
+            last_rx = xTaskGetTickCount();
+            if (strstr(buf, "RDY") || strstr(buf, "Call Ready") ||
+                strstr(buf, "SMS Ready") || strstr(buf, "PB Done")) {
+                ESP_LOGI(TAG, "  开机 URC: %s", buf);
+            }
+        } else if ((xTaskGetTickCount() - last_rx) >= pdMS_TO_TICKS(quiet_ms)) {
+            break;
+        }
+    }
+}
+
+/* 等模组开机后吐出 RDY。取代"打完 PWRKEY 盲等 2 秒"。 */
+static bool wait_boot_rdy(uint32_t timeout_ms)
+{
+    char buf[256];
+    char acc[512];
+    size_t acc_len = 0;
+    acc[0] = '\0';
+    TickType_t t0 = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        int len = uart_read_bytes(UART_EG800_NUM, (uint8_t*)buf, sizeof(buf) - 1,
+                                  pdMS_TO_TICKS(20));
+        if (len > 0) {
+            buf[len] = '\0';
+            if (acc_len + len < sizeof(acc) - 1) {
+                memcpy(acc + acc_len, buf, len);
+                acc_len += len;
+                acc[acc_len] = '\0';
+            } else {
+                acc_len = 0; acc[0] = '\0';       // 溢出就重来，只关心是否出现 RDY
+            }
+            if (strstr(acc, "RDY")) { return true; }
+        }
+    }
+    return false;
+}
+
+/* 反复发 AT 直到模组应答。比"盲等 N 秒让模组稳定"准确：
+ * 模组什么时候能收命令，它自己说了算。 */
+static bool wait_modem_responsive(uint32_t timeout_ms)
+{
+    TickType_t t0 = xTaskGetTickCount();
+    int tries = 0;
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        tries++;
+        send_at_command("AT");
+        if (wait_for_ok(500)) {
+            ESP_LOGI(TAG, "  模组已响应 AT（第 %d 次，用时 %lu ms）", tries,
+                     (unsigned long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS));
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW(TAG, "  模组 %lu ms 内没有响应 AT", (unsigned long)timeout_ms);
+    return false;
+}
+
+/* 轮询一条查询命令，直到响应里出现 want（或 want2）。用于等 SIM 就绪、等注网。 */
+static bool poll_until(const char *cmd, const char *want, const char *want2,
+                       uint32_t timeout_ms, uint32_t interval_ms, const char *what)
+{
+    char resp[256];
+    TickType_t t0 = xTaskGetTickCount();
+    TickType_t last_note = t0;
+    int polls = 0;
+
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        polls++;
+        send_at_command(cmd);
+        int n = uart_read_response(resp, sizeof(resp), 1500);
+        if (n > 0 && (strstr(resp, want) || (want2 && strstr(resp, want2)))) {
+            ESP_LOGI(TAG, "  %s 就绪，用时 %lu ms（查询 %d 次）", what,
+                     (unsigned long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS), polls);
+            return true;
+        }
+        // 长步骤每 5 秒报一次进度，免得刷屏也免得看不到在干嘛
+        if ((xTaskGetTickCount() - last_note) >= pdMS_TO_TICKS(5000)) {
+            last_note = xTaskGetTickCount();
+            for (int k = 0; k < n; ++k) {
+                if (resp[k] == '\r' || resp[k] == '\n') { resp[k] = ' '; }
+            }
+            ESP_LOGI(TAG, "  等 %s ... 已 %lu 秒，最近响应: %.60s", what,
+                     (unsigned long)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS / 1000),
+                     n > 0 ? resp : "(无)");
+        }
+        vTaskDelay(pdMS_TO_TICKS(interval_ms));
+    }
+    ESP_LOGW(TAG, "  %s 等待超时（%lu ms，查询 %d 次）", what,
+             (unsigned long)timeout_ms, polls);
+    return false;
+}
+
+/* ---- 时序打点：每一步花多久，直接从串口读 ---- */
+#define AT_SEQ_MAX_STEPS 16
+static struct { const char *name; uint32_t ms; } s_steps[AT_SEQ_MAX_STEPS];
+static int        s_step_n = 0;
+static TickType_t s_step_t0, s_seq_t0;
+
+static void seq_begin(void) { s_step_n = 0; s_seq_t0 = s_step_t0 = xTaskGetTickCount(); }
+static void seq_step_reset(void) { s_step_t0 = xTaskGetTickCount(); }
+
+static void step(const char *name)
+{
+    TickType_t now = xTaskGetTickCount();
+    uint32_t ms = (uint32_t)((now - s_step_t0) * portTICK_PERIOD_MS);
+    s_step_t0 = now;
+    if (s_step_n < AT_SEQ_MAX_STEPS) {
+        s_steps[s_step_n].name = name;
+        s_steps[s_step_n].ms   = ms;
+        s_step_n++;
+    }
+    ESP_LOGI("TIMING", "  %-26s %5lu ms", name, (unsigned long)ms);
+}
+
+static void seq_report(const char *title)
+{
+    uint32_t total = (uint32_t)((xTaskGetTickCount() - s_seq_t0) * portTICK_PERIOD_MS);
+    ESP_LOGW("TIMING", "======== %s 耗时汇总 ========", title);
+    for (int i = 0; i < s_step_n; ++i) {
+        ESP_LOGW("TIMING", "  %-26s %6lu ms  %3d%%", s_steps[i].name,
+                 (unsigned long)s_steps[i].ms,
+                 total ? (int)(s_steps[i].ms * 100 / total) : 0);
+    }
+    ESP_LOGW("TIMING", "  %-26s %6lu ms", "总计", (unsigned long)total);
+}
+
+/* ---- 网络诊断：把模组当前的 APN / 运营商 / 制式 / 信号打出来 ----
+ * 纯查询，不改任何配置。4 条 AT 约 120 ms，对上报耗时影响可忽略。
+ * 放在注网成功之后：这时 COPS/QNWINFO 才有有效值。
+ * 不想要的话把 MODEM_NET_DIAG 定义成 0。 */
+#ifndef MODEM_NET_DIAG
+#define MODEM_NET_DIAG 1
+#endif
+
+#if MODEM_NET_DIAG
+static void net_diag_one(const char *cmd, const char *what)
+{
+    char resp[256];
+    send_at_command(cmd);
+    int n = uart_read_response(resp, sizeof(resp), 2000);
+    if (n <= 0) { ESP_LOGW(TAG, "  [诊断] %-10s %s -> 无响应", what, cmd); return; }
+    /* 换行压成空格，一行一条好看 */
+    for (int k = 0; k < n; ++k) {
+        if (resp[k] == '\r' || resp[k] == '\n') { resp[k] = ' '; }
+    }
+    ESP_LOGI(TAG, "  [诊断] %-10s %s", what, resp);
+}
+
+static void net_diag_dump(void)
+{
+    ESP_LOGI(TAG, "---- 网络诊断（只读，不改配置）----");
+    net_diag_one("AT+CGDCONT?", "APN/PDP");   // context 1 实际用的 APN
+    net_diag_one("AT+COPS?",    "运营商");     // 注册到谁、什么制式
+    net_diag_one("AT+QNWINFO",  "频段");       // 制式/频段，为后面锁频做准备
+    net_diag_one("AT+CSQ",      "信号");       // rssi,ber  (99,99 = 未知)
+    ESP_LOGI(TAG, "-----------------------------------");
+}
+#else
+static void net_diag_dump(void) { }
+#endif
 bool mqtt_init_network(void)
 {
     ESP_LOGI(TAG, "Initializing 4G network...");
-    
-    // 0. 清理上电URC
-    ESP_LOGI(TAG, "Warm-up: draining boot URCs...");
-    uint32_t drain_start = xTaskGetTickCount();
-    char drain_buf[256];
-    while ((xTaskGetTickCount() - drain_start) < (3000 / portTICK_PERIOD_MS)) {
-        int len = uart_read_bytes(UART_EG800_NUM, (uint8_t*)drain_buf, sizeof(drain_buf) - 1, 50 / portTICK_PERIOD_MS);
-        if (len > 0) {
-            drain_buf[len] = '\0';
-            if (strstr(drain_buf, "RDY") || strstr(drain_buf, "Call Ready") || strstr(drain_buf, "SMS Ready") || strstr(drain_buf, "PB Done")) {
-                ESP_LOGI(TAG, "Boot URC: %s", drain_buf);
-            }
-        } else {
-            vTaskDelay(50 / portTICK_PERIOD_MS);
-        }
-    }
-    
-    // 1. 检查模组状态
-    ESP_LOGI(TAG, "Step 1: Checking module status (AT handshake with retries)...");
-    bool at_ok = false;
-    for (int attempt = 1; attempt <= 5 && !at_ok; ++attempt) {
-        send_at_command("AT");
-        at_ok = wait_for_ok(1000);
-        if (!at_ok) {
-            ESP_LOGW(TAG, "AT no response, retry %d/5", attempt);
-            vTaskDelay(300 / portTICK_PERIOD_MS);
-        }
-    }
-    if (!at_ok) {
-        ESP_LOGW(TAG, "Module not responding to AT command after retries");
+    seq_step_reset();   // 每次 attempt 重新计时
+
+    /* 0. 等模组把开机 URC 说完。原来是死等 3 秒，现在静默 300 ms 就走。 */
+    drain_until_quiet(MODEM_DRAIN_QUIET_MS, MODEM_DRAIN_MAX_MS);
+    step("清开机 URC");
+
+    /* 1. 等模组能收命令。
+     * 原来是"AT 握手最多 5 次"+ 后面 CFUN 之后再盲等 3 秒"让模组稳定"，
+     * 现在合并成一件事：一直发 AT 直到它回 OK —— 回了就说明真的稳定了。 */
+    if (!wait_modem_responsive(MODEM_AT_READY_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "Module not responding to AT command");
         return false;
     }
-    
-    // 2. 关闭回显
-    ESP_LOGI(TAG, "Step 2: Disabling echo...");
+    step("等模组响应 AT");
+
+    // 2. 关回显 + 读 IMEI
     send_at_command("ATE0");
-    wait_for_ok(3000);
-
-    // 2.1 读取 IMEI 作为 deviceId（只取一次，之后沿用缓存）
+    wait_for_ok(1000);
     device_fetch_imei();
+    step("ATE0 + 读 IMEI");
 
-    // 3. 设置全功能模式
-    ESP_LOGI(TAG, "Step 3: Setting full functionality mode...");
-    send_at_command("AT+CFUN=1");
-    if (!wait_for_ok(15000)) {
-        ESP_LOGW(TAG, "Failed to set full functionality mode");
-        return false;
+    /* 3. 射频功能。先查再设 —— 刚上电通常本来就是 CFUN=1，
+     * 无条件发 CFUN=1 会让模组重跑一遍射频初始化，白白多花几秒。 */
+    send_at_command("AT+CFUN?");
+    bool cfun_ok = wait_for_contains("+CFUN: 1", 2000);
+    if (!cfun_ok) {
+        ESP_LOGI(TAG, "  CFUN 不是 1，设置全功能模式...");
+        send_at_command("AT+CFUN=1");
+        if (!wait_for_ok(15000)) {
+            ESP_LOGW(TAG, "Failed to set full functionality mode");
+            return false;
+        }
+    } else {
+        ESP_LOGI(TAG, "  CFUN 已经是 1，跳过设置");
     }
-    
-    // 等待模组稳定
-    ESP_LOGI(TAG, "Waiting for module to stabilize...");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    
-    // 4. 检查SIM卡状态
-    ESP_LOGI(TAG, "Step 4: Checking SIM card status...");
-    send_at_command("AT+CPIN?");
-    if (!wait_for_contains("READY", 5000)) {
+    step("CFUN 查/设");
+
+    /* 4. 等 SIM 就绪。原来只发一次 CPIN? 就往下走，模组还没准备好也不管。 */
+    if (!poll_until("AT+CPIN?", "READY", NULL,
+                    MODEM_SIM_TIMEOUT_MS, 150, "SIM 卡")) {
         ESP_LOGW(TAG, "SIM card not ready");
     }
-    
-    // 5. 设置APN
+    step("等 SIM 就绪");
+
+    // 5. APN（只在第一次设）
     if (strlen(APN_NAME) > 0 && !apn_configured) {
-        ESP_LOGI(TAG, "Step 5: Setting APN to %s (first time)...", APN_NAME);
         char apn_cmd[128];
         snprintf(apn_cmd, sizeof(apn_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", APN_NAME);
         send_at_command(apn_cmd);
@@ -310,56 +497,76 @@ bool mqtt_init_network(void)
             return false;
         }
         apn_configured = true;
-        ESP_LOGI(TAG, "APN configured successfully, will not set again");
-    } else if (strlen(APN_NAME) > 0 && apn_configured) {
-        ESP_LOGI(TAG, "Step 5: Skipping APN setting (already configured this session)");
-    } else {
-        ESP_LOGI(TAG, "Step 5: Skipping APN setting (APN_NAME is empty)");
+        ESP_LOGI(TAG, "  APN 已配置");
     }
-    
-    // 6. 激活PDP上下文
-    ESP_LOGI(TAG, "Step 6: Activating PDP context...");
-    send_at_command("AT+CGACT=1,1");
-    if (!wait_for_ok(30000)) {
-        ESP_LOGW(TAG, "Failed to activate PDP context");
+
+    /* 6. 等注册上网。
+     * 原代码没有这一步，没注上网就直接发 CGACT，会一路卡到 CGACT 的 30 秒
+     * 超时然后整轮判失败重来。先确认注册再激活，失败也能早点知道原因。
+     * +CEREG: n,1 = 已注册本网，n,5 = 漫游注册。 */
+    if (!poll_until("AT+CEREG?", ",1", ",5",
+                    MODEM_REG_TIMEOUT_MS, 400, "网络注册")) {
+        ESP_LOGW(TAG, "未能在超时内注册到网络（信号 / SIM / 天线？）");
         return false;
     }
-    
-    // 7. 查询IP地址
-    ESP_LOGI(TAG, "Step 7: Getting IP address...");
-    send_at_command("AT+CGPADDR=1");
-    if (!wait_for_ok(5000)) {
-        ESP_LOGW(TAG, "Failed to get IP address, but continuing...");
+    step("等注网");
+
+    /* 注网成功后 dump 一次：APN 是什么、注到哪家、什么频段、信号多少。 */
+    net_diag_dump();
+    step("网络诊断");
+
+    /* 7. 激活 PDP。先查，已经激活就跳过。 */
+    send_at_command("AT+CGACT?");
+    if (wait_for_contains("+CGACT: 1,1", 2000)) {
+        ESP_LOGI(TAG, "  PDP 已激活，跳过");
+    } else {
+        send_at_command("AT+CGACT=1,1");
+        if (!wait_for_ok(30000)) {
+            ESP_LOGW(TAG, "Failed to activate PDP context");
+            return false;
+        }
     }
-    
+    step("激活 PDP");
+
     ESP_LOGI(TAG, "4G network initialized successfully");
+    return true;
+}
+
+/* force=false：没有会话就直接返回，不发无用的 QMTDISC/QMTCLOSE。
+ * force=true ：重试路径用，socket 可能半开，必须强拆。 */
+static bool do_disconnect(bool force)
+{
+    if (!mqtt_session_open && !force) {
+        ESP_LOGI(TAG, "无 MQTT 会话，跳过 QMTDISC/QMTCLOSE");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Closing MQTT connection...");
+
+    // 1. 断开MQTT客户端连接
+    send_at_command("AT+QMTDISC=0");
+    bool disc_ok = wait_for_ok_then_contains("+QMTDISC: 0,0", 5000);
+
+    // 2. 关闭MQTT网络连接
+    send_at_command("AT+QMTCLOSE=0");
+    bool close_ok = wait_for_ok_then_contains("+QMTCLOSE: 0,0", 5000);
+
+    /* 收到 +QMTCLOSE: 0,0 就说明真的关完了，不需要再盲等 1 秒。
+     * 只有在没等到 URC（可能是 ERROR / 超时）时才给模组一点缓冲。 */
+    if (!close_ok) {
+        ESP_LOGW(TAG, "未收到 QMTCLOSE URC（disc=%d close=%d），补 200ms 缓冲",
+                 disc_ok, close_ok);
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+    }
+
+    ESP_LOGI(TAG, "MQTT connection closed");
+    mqtt_session_open = false;
     return true;
 }
 
 bool mqtt_disconnect_broker(void)
 {
-    ESP_LOGI(TAG, "Closing MQTT connection...");
-    if (!mqtt_session_open) {
-        ESP_LOGI(TAG, "Session flag = false, still force sending QMTDISC/QMTCLOSE for safety");
-    }
-    
-    // 1. 断开MQTT客户端连接
-    send_at_command("AT+QMTDISC=0");
-    if (!wait_for_ok_then_contains("+QMTDISC: 0,0", 5000)) {
-        // 容忍失败
-    }
-    
-    // 2. 关闭MQTT网络连接
-    send_at_command("AT+QMTCLOSE=0");
-    if (!wait_for_ok_then_contains("+QMTCLOSE: 0,0", 5000)) {
-        // 容忍失败
-    }
-    
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    
-    ESP_LOGI(TAG, "MQTT connection closed");
-    mqtt_session_open = false;
-    return true;
+    return do_disconnect(false);
 }
 
 bool mqtt_connect_broker(void)
@@ -369,8 +576,13 @@ bool mqtt_connect_broker(void)
     // 最多尝试3次连接
     for (int attempt = 1; attempt <= 3; ++attempt) {
         ESP_LOGI(TAG, "Attempt %d/3: Cleaning up and connecting...", attempt);
-        mqtt_disconnect_broker();
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        /* 第 1 次：模组刚开机、没有会话时直接跳过清理。
+         * 第 2/3 次：上一轮可能把 socket 留成半开，强制拆掉再来。 */
+        bool cleaned = (mqtt_session_open || attempt > 1);
+        do_disconnect(attempt > 1);
+        if (cleaned) {
+            vTaskDelay(300 / portTICK_PERIOD_MS);   // 只在真拆过连接时给缓冲
+        }
 
         // 1. 配置MQTT服务器版本
         ESP_LOGI(TAG, "Step 1: Setting MQTT version...");
@@ -412,6 +624,7 @@ bool mqtt_connect_broker(void)
         }
 
         ESP_LOGI(TAG, "Connected to MQTT broker successfully (attempt %d)", attempt);
+        step("连 broker");
         mqtt_session_open = true;
         return true;
 
@@ -451,6 +664,7 @@ bool mqtt_publish_message(const char* topic, const char* message)
     }
     
     ESP_LOGI(TAG, "Message published successfully");
+    step("发布消息");
     return true;
 }
 
@@ -459,7 +673,7 @@ void mqtt_poll_urc(void)
     if (mqtt_state != MQTT_STATE_CONNECTED) {
         return;
     }
-    if (uart_read_busy) {
+    if (uart_read_busy || s_modem_debug_hold) {
         return;
     }
 
@@ -491,14 +705,54 @@ void modem_power_cycle(void)
     /* Cattle_T: EG800。3.8V 轨默认是关的（MODEM_RAIL_ON_AT_BOOT=0），
      * 这里先开轨并等稳压建立，再打 PWRKEY 脉冲。
      * IO33(PWRKEY) 经 Q8 反相，置 1 相当于把 PWRKEY 拉低。 */
-    ESP_LOGI("MODEM", "Power-cycle EG800: 先开 3.8V 轨，再走 PWRKEY 时序");
+    ESP_LOGI("MODEM", "Power-cycle EG800: 开 3.8V 轨 -> PWRKEY 脉冲 -> 等 RDY");
     modem_power_enable(true);
     vTaskDelay(MODEM_RAIL_SETTLE_MS / portTICK_PERIOD_MS);
-    gpio_set_level(QT_POWER_PIN, 0);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    gpio_set_level(QT_POWER_PIN, 1);
-    vTaskDelay(2000 / portTICK_PERIOD_MS);
-    gpio_set_level(QT_POWER_PIN, 0);
+
+    /* PWRKEY 脉冲宽度：EG800 规格是拉低 ≥500ms，这里默认 600ms。
+     * 万一 600ms 边界不够（等不到 RDY 且 STATUS 仍为 0），自动补一发
+     * MODEM_PWRKEY_PULSE_RETRY_MS 的长脉冲，不至于整轮上报失败。 */
+    uint32_t pulse = MODEM_PWRKEY_PULSE_MS;
+    bool rdy = false;
+    uint32_t ms = 0;
+
+    for (int attempt = 1; attempt <= 2; ++attempt) {
+        gpio_set_level(QT_POWER_PIN, 0);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+        gpio_set_level(QT_POWER_PIN, 1);                   // 置 1 = 模组 ~PWRKEY 拉低
+        vTaskDelay(pulse / portTICK_PERIOD_MS);
+        gpio_set_level(QT_POWER_PIN, 0);                   // 释放
+
+        /* 等模组自己吐 RDY，而不是盲等固定秒数。 */
+        TickType_t t0 = xTaskGetTickCount();
+#if ENABLE_MQTT
+        rdy = wait_boot_rdy(MODEM_BOOT_RDY_TIMEOUT_MS);
+#else
+        /* ENABLE_MQTT=0 时没有 UART1 收发，只能退回固定等待 */
+        vTaskDelay(MODEM_BOOT_RDY_TIMEOUT_MS / 4 / portTICK_PERIOD_MS);
+        rdy = false;
+#endif
+        ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
+
+        if (rdy) {
+            ESP_LOGI("MODEM", "收到 RDY，模组已开机（脉冲 %lu ms，RDY 用时 %lu ms）",
+                     (unsigned long)pulse, (unsigned long)ms);
+            return;
+        }
+        if (modem_is_powered()) {
+            ESP_LOGW("MODEM", "没收到 RDY 但 STATUS=1，认为已开机（脉冲 %lu ms）",
+                     (unsigned long)pulse);
+            return;
+        }
+        if (attempt == 1) {
+            ESP_LOGW("MODEM", "%lu ms 脉冲没能开机（RDY 无 / STATUS=0），补一发 %d ms 长脉冲",
+                     (unsigned long)pulse, MODEM_PWRKEY_PULSE_RETRY_MS);
+            pulse = MODEM_PWRKEY_PULSE_RETRY_MS;
+        }
+    }
+
+    ESP_LOGW("MODEM", "两次 PWRKEY 都没等到 RDY，继续（后面用 AT 轮询兜底）。STATUS(IO%d)=%d",
+             MODEM_STATUS_PIN, gpio_get_level(MODEM_STATUS_PIN));
 }
 
 static void modem_power_off_soft(void)
@@ -723,6 +977,13 @@ static void manual_publish_task(void *pv)
     (void)pv;
     bool powered_here = false;
 
+    if (s_modem_debug_hold) {
+        ESP_LOGW("PUB", "模组处于调试保持模式，忽略手动上报");
+        s_manual_pub_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
     // 不等待：周期任务正在用模组的话，这次手动请求直接放弃，避免两个任务抢 UART1
     if (!modem_bus_lock(0)) {
         ESP_LOGW("PUB", "Cycle task is using the modem, manual publish skipped");
@@ -741,15 +1002,20 @@ static void manual_publish_task(void *pv)
     led_blink(LED_CONN_PIN, GPS_UPLOAD_BLINK_TIMES,
               GPS_UPLOAD_BLINK_ON_MS, GPS_UPLOAD_BLINK_OFF_MS);
 
+    seq_begin();    // 无论模组开没开都要开始计时，否则总计是从上电算起的假数
     if (!modem_is_powered()) {
         ESP_LOGI("PUB", "Modem is off, powering up...");
         modem_power_cycle();
         powered_here = true;
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        step("模组开机");
+    } else {
+        ESP_LOGI("PUB", "Modem already on (STATUS=1)，跳过开机");
+        step("模组开机(已开,跳过)");
     }
 
     bool ok = publish_battery_payload();
     ESP_LOGI("PUB", "Manual publish %s", ok ? "SUCCESS" : "FAILED");
+    seq_report(ok ? "手动上报（成功）" : "手动上报（失败）");
 
     // 结果指示：成功闪 3 下，失败长亮一下
     if (ok) {
@@ -766,6 +1032,64 @@ static void manual_publish_task(void *pv)
     modem_bus_unlock();
     s_manual_pub_running = false;
     vTaskDelete(NULL);
+}
+
+/* ===================== 模组调试保持模式 =====================
+ * 长按 IO0 进入。只做一件事：确认模组开着；没开就打一次 PWRKEY。
+ * 之后 ESP32 什么都不做 —— 不发 AT、不碰 GNSS、不闪灯、不再动任何引脚，
+ * 把板子完整交给你用模组的 USB 口调试。只能靠复位退出。
+ * ============================================================ */
+static void modem_debug_hold_task(void *pv)
+{
+    (void)pv;
+
+    /* 永久占住模组总线锁，这样双击的手动上报会自己跳过，不来抢 UART1。 */
+    modem_bus_lock(portMAX_DELAY);
+    s_modem_debug_hold = true;
+
+    ESP_LOGW("HOLD", "=== 模组调试保持模式 ===");
+
+    // 1. 确保 3.8V 轨打开
+    modem_power_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // 2. 看 STATUS：为 0 就是没开机，打一次 PWRKEY
+    int st = gpio_get_level(MODEM_STATUS_PIN);
+    ESP_LOGW("HOLD", "STATUS(IO%d) = %d", MODEM_STATUS_PIN, st);
+
+    if (st == 0) {
+        ESP_LOGW("HOLD", "模组未开机，打 PWRKEY：IO%d 置 1 保持 2 秒再释放", QT_POWER_PIN);
+        gpio_set_level(QT_POWER_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        gpio_set_level(QT_POWER_PIN, 0);
+
+        // 等模组起来，每秒看一次 STATUS，最多 10 秒
+        for (int i = 1; i <= 10; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            st = gpio_get_level(MODEM_STATUS_PIN);
+            ESP_LOGW("HOLD", "  +%d s  STATUS = %d", i, st);
+            if (st) { break; }
+        }
+    } else {
+        ESP_LOGW("HOLD", "模组已经开着，不打 PWRKEY");
+    }
+
+    ESP_LOGW("HOLD", "%s", st ? "模组已开机，交给 USB 侧调试"
+                              : "STATUS 仍为 0，模组没起来（查 3.8V 轨 / PWRKEY 到 J10.7 的通路）");
+    ESP_LOGW("HOLD", "ESP32 停止一切操作。退出请复位板子。");
+
+    // 3. 到此为止，什么都不做
+    vTaskSuspend(NULL);
+    while (1) { vTaskDelay(portMAX_DELAY); }
+}
+
+void mqtt_modem_debug_hold(void)
+{
+    if (s_modem_debug_hold) {
+        ESP_LOGW("HOLD", "已经在调试保持模式了");
+        return;
+    }
+    xTaskCreate(modem_debug_hold_task, "modem_hold", 3072, NULL, 6, NULL);
 }
 
 void mqtt_manual_publish_request(void)
@@ -897,13 +1221,22 @@ void gps_mqtt_cycle_task(void* pv)
                       GPS_UPLOAD_BLINK_ON_MS, GPS_UPLOAD_BLINK_OFF_MS);
 
             ESP_LOGI("GPS", "GNSS fix acquired, bringing up EG800 for MQTT publish");
-            ESP_LOGI("MODEM", "Wake EG800: about to PWRKEY pulse (power-cycle) to publish");
-            modem_power_cycle();
+            /* 与双击手动上报走同一套判断：深睡醒来时 3.8V 轨一定是关的，
+             * 但 ENABLE_DEEP_SLEEP=0 的连续运行模式下可能已经开着，别重复打 PWRKEY。 */
+            seq_begin();
+            if (!modem_is_powered()) {
+                ESP_LOGI("MODEM", "Wake EG800: PWRKEY pulse to publish");
+                modem_power_cycle();
+                step("模组开机");
+            } else {
+                ESP_LOGI("MODEM", "模组已在运行（STATUS=1），跳过开机");
+                step("模组开机(已开,跳过)");
+            }
             powered_modem = true;
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
 
             bool pub_ok = publish_battery_payload();
             ESP_LOGI("BAT", "Publish %s", pub_ok ? "success" : "failed");
+            seq_report(pub_ok ? "周期上报（成功）" : "周期上报（失败）");
 #if ENABLE_DEEP_SLEEP
             if (pub_ok) { app_note_publish_ok(); }
 #endif
@@ -944,6 +1277,16 @@ void gps_mqtt_cycle_task(void* pv)
 
 void mqtt_init(void)
 {
+    /* 幂等：自测模式下 app_main 和 Selftest_task 都会调到这里，
+     * 重复 uart_driver_install() 返回 ESP_ERR_INVALID_STATE，会被
+     * ESP_ERROR_CHECK 直接 abort。 */
+    static bool inited = false;
+    if (inited) {
+        ESP_LOGI("UART", "mqtt_init() 已初始化过，跳过");
+        return;
+    }
+    inited = true;
+
     if (s_modem_mutex == NULL) {
         s_modem_mutex = xSemaphoreCreateMutex();
     }
