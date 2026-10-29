@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 #include "eg915_selftest.h"
 #include "tracking_policy.h"
+#include "fence_bench.h"
 
 static const char *TAG = "APP";
 
@@ -38,7 +39,18 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Cattle Tracker Application Starting...");
 
-#if SELFTEST
+#if FENCE_BENCH
+    /* 围栏台架测试固件：只起 GPIO（含引脚安全态）+ 电池 ADC + 控制台。
+     * 刻意不启动 GNSS / MQTT / 运动传感器 / gps_mqtt_cycle_task ——
+     * 后者会在 30 秒后进深睡，测到一半板子就睡了。 */
+    gpio_init();
+    battery_init();
+    fence_bench_start();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#elif SELFTEST
     // 自测模式：仅初始化GPIO，然后创建自测任务
     gpio_init();
 

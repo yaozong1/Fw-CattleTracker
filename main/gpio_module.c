@@ -1,6 +1,7 @@
 #include "gpio_module.h"
 #include "hardware_config.h"
 #include "driver/gpio.h"
+#include "esp_rom_gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +14,8 @@ static bool s_led_conn_on = false;
 
 // 电子围栏供电轨状态
 static bool s_fence_rails_on = false;
+static bool s_fence_iso_on   = false;
+static bool s_fence_12v_on   = false;
 
 void gpio_init(void)
 {
@@ -91,29 +94,48 @@ void power_control_init(void)
 }
 
 /* ============ 电子围栏 ============ */
+/* 把一个"动作"引脚钉死在低电平。
+ *
+ * 不用 gpio_reset_pin()：它的实现是「输入 + 使能内部上拉(~45kΩ)」。
+ * 对 IO9 (LT3750 CHARGE) 和 IO13 (PC817 Trig) 来说，那一瞬间等于主动置位 ——
+ * 启动日志里 "GPIO[9] ... Pullup: 1" 就是这么来的。这两个脚板上都没有外部
+ * 下拉（12V_EN 有 R77 10k、5V0_ISO_EN 有 R63 10k，这两个没有），所以这里
+ * 必须自己把内部上拉关掉、换成内部下拉。
+ *
+ * 顺序同样关键：先写电平再切方向。深睡醒来后输出锁存器复位为 0，
+ * 反过来会让引脚先输出一次毛刺（GNSS 电源那个坑就是这么来的）。 */
+static void fence_pin_force_low(int pin)
+{
+    esp_rom_gpio_pad_select_gpio(pin);   /* 只选 GPIO 功能，不碰上下拉 */
+    gpio_set_level(pin, 0);              /* 先写电平 */
+    gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(pin, 0);
+    gpio_pullup_dis(pin);
+    gpio_pulldown_en(pin);               /* 万一哪天回到输入态，也是往下走 */
+}
+
 void fence_pins_safe_init(void)
 {
-    gpio_reset_pin(FENCE_TRIG_PIN);
-    gpio_set_direction(FENCE_TRIG_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(FENCE_TRIG_PIN, 0);          // 绝对不能默认触发
+    /* 两个"动作"脚：没有外部下拉，必须最先钉死 */
+    fence_pin_force_low(FENCE_TRIG_PIN);        /* 绝对不能默认触发 */
+    fence_pin_force_low(FENCE_CHARGE_EN_PIN);   /* LT3750 不充电 */
 
-    gpio_reset_pin(FENCE_CHARGE_EN_PIN);
-    gpio_set_direction(FENCE_CHARGE_EN_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(FENCE_CHARGE_EN_PIN, 0);     // LT3750 不充电
-
+    /* DONE# 是 LT3750 的开漏输出，板上 R81 上拉。纯输入，不要加内部上拉 */
+    esp_rom_gpio_pad_select_gpio(FENCE_CHARGE_DONE_PIN);
     gpio_set_direction(FENCE_CHARGE_DONE_PIN, GPIO_MODE_INPUT);
+    gpio_pullup_dis(FENCE_CHARGE_DONE_PIN);
+    gpio_pulldown_dis(FENCE_CHARGE_DONE_PIN);
 
-    gpio_reset_pin(FENCE_12V_EN_PIN);
-    gpio_set_direction(FENCE_12V_EN_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(FENCE_12V_EN_PIN, 0);        // 12V 升压关闭
-
-    gpio_reset_pin(FENCE_5V_ISO_EN_PIN);
-    gpio_set_direction(FENCE_5V_ISO_EN_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(FENCE_5V_ISO_EN_PIN, 0);     // 隔离 5V 关闭
+    /* 两个电源使能脚：板上各有 10k 外部下拉兜底，这里也一并钉低 */
+    fence_pin_force_low(FENCE_12V_EN_PIN);      /* 12V 升压关闭 */
+    fence_pin_force_low(FENCE_5V_ISO_EN_PIN);   /* 隔离 5V 关闭 */
 
     s_fence_rails_on = false;
+    s_fence_iso_on   = false;
+    s_fence_12v_on   = false;
 
-    ESP_LOGI(TAG, "Fence pins in SAFE state (charge off, no trigger)");
+    ESP_LOGI(TAG, "Fence pins in SAFE state (charge off, no trigger, pulldown on IO%d/IO%d)",
+             FENCE_CHARGE_EN_PIN, FENCE_TRIG_PIN);
 }
 
 /* ================= deep sleep 引脚状态 =================
@@ -182,15 +204,32 @@ void deep_sleep_release_pins(void)
     gpio_deep_sleep_hold_dis();
 }
 
+void fence_iso_enable(bool on)
+{
+    gpio_set_level(FENCE_5V_ISO_EN_PIN, on ? 1 : 0);
+    s_fence_iso_on = on;
+    ESP_LOGI(TAG, "Fence 5V0_ISO_EN (IO%d) -> %s", FENCE_5V_ISO_EN_PIN, on ? "ON" : "OFF");
+}
+
+void fence_12v_enable(bool on)
+{
+    gpio_set_level(FENCE_12V_EN_PIN, on ? 1 : 0);
+    s_fence_12v_on = on;
+    ESP_LOGI(TAG, "Fence 12V_EN (IO%d) -> %s", FENCE_12V_EN_PIN, on ? "ON" : "OFF");
+}
+
+bool fence_iso_is_on(void) { return s_fence_iso_on; }
+bool fence_12v_is_on(void) { return s_fence_12v_on; }
+
 void fence_rails_enable(bool on)
 {
     if (on) {
         // 先开控制侧的隔离 5V，再开 12V 升压
-        gpio_set_level(FENCE_5V_ISO_EN_PIN, 1);
-        gpio_set_level(FENCE_12V_EN_PIN, 1);
+        fence_iso_enable(true);
+        fence_12v_enable(true);
     } else {
-        gpio_set_level(FENCE_12V_EN_PIN, 0);
-        gpio_set_level(FENCE_5V_ISO_EN_PIN, 0);
+        fence_12v_enable(false);
+        fence_iso_enable(false);
     }
     // 无论如何，充电与触发保持关闭
     gpio_set_level(FENCE_CHARGE_EN_PIN, 0);

@@ -42,6 +42,13 @@ void deep_sleep_release_pins(void);
 // 电子围栏电源轨（12V_EN + 5V0_ISO_EN）。
 // 只开/关供电轨，CHARGE 与 TRIG 始终保持低电平，不会充电也不会放电。
 void fence_rails_enable(bool on);
+
+// 单独控制两条供电轨（台架测试用；fence_rails_enable 内部也走这两个）
+// 注意：D25 未焊时不要打开 12V —— MT3608 没有输出通路会持续雪崩。
+void fence_iso_enable(bool on);
+void fence_12v_enable(bool on);
+bool fence_iso_is_on(void);
+bool fence_12v_is_on(void);
 bool fence_rails_are_on(void);
 
 // Trig 方波测试：拉高 on_ms、拉低 off_ms，重复 times 次，结束后保证停在低电平。

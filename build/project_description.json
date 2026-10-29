@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "cattle_tracker",
-    "project_version":    "2fd4ab6-dirty",
+    "project_version":    "75e6d91-dirty",
     "project_path":       "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker",
     "idf_path":           "C:/Users/h1576/esp/v5.3.2/esp-idf",
     "build_dir":          "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/build",
@@ -1180,7 +1180,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/build/esp-idf/main/libmain.a",
-            "sources": [ "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/main.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/eg915_selftest.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/self_test.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/motion_sensor.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/gnss_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/mqtt_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/battery_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/gpio_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/button_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/timer_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/tracking_policy.c" ],
+            "sources": [ "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/main.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/eg915_selftest.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/self_test.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/motion_sensor.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/gnss_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/mqtt_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/battery_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/gpio_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/button_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/timer_module.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/tracking_policy.c", "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/main/fence_bench.c" ],
             "include_dirs": []
         },
         "mbedtls": {

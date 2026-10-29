@@ -502,6 +502,91 @@
 #define TRACK_FIX_TIMEOUT_LOW_S  90
 #endif
 
+/* ==================== 电子围栏台架测试（fence_bench） ====================
+ * FENCE_BENCH=1 编出来的是一版【专用台架测试固件】，不是生产固件：
+ *   - 不启动 gps_mqtt_cycle_task，所以不会进深睡（否则测到一半就睡了）
+ *   - 不启动 GNSS / MQTT / 运动传感器，串口输出干净
+ *   - 在控制台上开一组 `f` 开头的命令
+ *
+ * 生产固件里【绝对不要】保留"从串口给储能电容充电"这条路径。
+ * ======================================================================== */
+#ifndef FENCE_BENCH
+#define FENCE_BENCH 1
+#endif
+
+/* D25 (SS14) 焊了没有。
+ * D25 是 5V->12V 升压(U18 MT3608)的整流二极管，而 12V 就是 LT3750 的 VCC。
+ * D25 不在 => 12V 轨恒为 0 => LT3750 完全无法工作 => 整个高压部分是死的。
+ * 这是阶段 1 能零风险做完的根本原因，所以把它做成一个显式开关：
+ *   0 = 未焊，阶段 1。拒绝一切会打开 12V 或充电的命令。
+ *   1 = 已焊，阶段 2。开放充电（阶段 2 代码另行加入，现在还没有）。
+ *
+ * 为什么 D25 没焊时连 12V_EN 都不许开：MT3608 没有输出通路，FB 恒为 0，
+ * 它会一直按最大占空比开关，L14 每周期攒的能量无处可去，只能靠内部开关
+ * 反复雪崩泄放。单次脉冲无所谓，持续几十毫秒就足以把它打死。 */
+#ifndef FENCE_BENCH_D25_FITTED
+#define FENCE_BENCH_D25_FITTED 1
+#endif
+
+/* 控制台走哪个口：0 = UART0 (TXD0/RXD0)，1 = USB-Serial-JTAG */
+#ifndef FENCE_BENCH_CONSOLE_USB
+#define FENCE_BENCH_CONSOLE_USB 0
+#endif
+
+/* `f arm` 之后多少秒自动解除。解除后 trig 一律拒绝执行。 */
+#ifndef FENCE_BENCH_ARM_TIMEOUT_S
+#define FENCE_BENCH_ARM_TIMEOUT_S 60
+#endif
+
+/* `f 12v pulse` 的脉宽（ms）。只为了用示波器确认 IO47 能翻转，
+ * 短到 MT3608 的软启动都还没结束。不要调大。 */
+#ifndef FENCE_BENCH_12V_PULSE_MS
+#define FENCE_BENCH_12V_PULSE_MS 2
+#endif
+
+/* `f trig` 的硬上限，命令行传再大也会被钳到这里 */
+/* ---- 阶段 2：充电 ---- */
+
+/* 单次充电命令的硬上限（ms）。命令行传再大都会被钳到这里。
+ * 为什么是 2000：充电采样是忙等（200 µs 一次），这期间同核的 idle 任务跑不了，
+ * 而 CONFIG_ESP_TASK_WDT_TIMEOUT_S = 5，留 2.5 倍余量。不要调大。 */
+#ifndef FENCE_BENCH_CHARGE_MAX_MS
+#define FENCE_BENCH_CHARGE_MAX_MS 2000
+#endif
+
+/* `f charge` 不带参数时的默认时长。第一次充电请从这个量级开始。 */
+#ifndef FENCE_BENCH_CHARGE_DEFAULT_MS
+#define FENCE_BENCH_CHARGE_DEFAULT_MS 50
+#endif
+
+/* 打开 12V 之后等 MT3608 软启动完成再开始充电 */
+#ifndef FENCE_BENCH_12V_SETTLE_MS
+#define FENCE_BENCH_12V_SETTLE_MS 50
+#endif
+
+/* ---- 维持模式 `f hold` ----
+ * 万用表 10 MΩ 并上板载 9.9 MΩ 泄放串 = 4.97 MΩ，τ 只有 1.9 秒，
+ * 不补电的话读数一路往下掉。维持模式按「充 CHARGE_MS / 歇 REST_MS」
+ * 反复补，让表能读稳。
+ * 这个做法不依赖 DONE 的极性 —— LT3750 到达目标电压后会自己停，
+ * 多余的补电脉冲只是空跑一两个开关周期，没有副作用。 */
+#ifndef FENCE_BENCH_HOLD_MAX_S
+#define FENCE_BENCH_HOLD_MAX_S 60
+#endif
+#ifndef FENCE_BENCH_HOLD_CHARGE_MS
+#define FENCE_BENCH_HOLD_CHARGE_MS 100
+#endif
+#ifndef FENCE_BENCH_HOLD_REST_MS
+#define FENCE_BENCH_HOLD_REST_MS 100
+#endif
+
+#ifndef FENCE_BENCH_TRIG_MAX_PULSES
+#define FENCE_BENCH_TRIG_MAX_PULSES 20
+#endif
+#ifndef FENCE_BENCH_TRIG_MAX_MS
+#define FENCE_BENCH_TRIG_MAX_MS 2000
+#endif
+
 /* ---- 醒着时的 5 秒采样窗口 ---- */
 #ifndef MOTION_WINDOW_MS
 #define MOTION_WINDOW_MS 5000
