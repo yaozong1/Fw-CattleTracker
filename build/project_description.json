@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "cattle_tracker",
-    "project_version":    "75e6d91-dirty",
+    "project_version":    "2ccc352-dirty",
     "project_path":       "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker",
     "idf_path":           "C:/Users/h1576/esp/v5.3.2/esp-idf",
     "build_dir":          "C:/Users/h1576/Desktop/PE_Project/Cattle_Tracker/Fw-CattleTracker/build",

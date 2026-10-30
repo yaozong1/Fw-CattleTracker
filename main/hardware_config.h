@@ -580,6 +580,65 @@
 #define FENCE_BENCH_HOLD_REST_MS 100
 #endif
 
+/* ---- 阶段 3：单发放电 `f fire` ----
+ * 流程：充电直到 DONE 跌落 -> 撤 CHARGE -> 等稳定 -> TRIG 脉冲 -> 可控硅导通放电
+ *
+ * DONE 极性已由数据手册确认：开集输出，**充电中保持高电平，停止充电时拉低**。
+ * 拉低有两种原因 —— 到达目标电压，或者故障（UVLO / 热关断）。
+ * 固件无法直接区分，所以用"最短合理充电时间"来判断（见下）。*/
+
+/* 等 DONE 的最长时间。超时说明根本没充到目标。 */
+#ifndef FENCE_BENCH_FIRE_CHARGE_MAX_MS
+#define FENCE_BENCH_FIRE_CHARGE_MAX_MS 2000
+#endif
+
+/* 最短合理充电时间（ms）。早于这个时刻的 DONE 一定不是"充满"。
+ * 依据：C51 充到 411 V 需要 32.9 mJ，每个开关周期送 ½×10µH×I_pk² ，
+ * R66=12mΩ 时 I_pk=6.5A、每周期 211 µJ，需要约 156 个周期 ≈ 3.3 ms。
+ * 取 2 ms 留余量。改了 R66 或目标电压要同步改这个值。 */
+#ifndef FENCE_BENCH_FIRE_MIN_MS
+#define FENCE_BENCH_FIRE_MIN_MS 2
+#endif
+
+/* 撤掉 CHARGE 到发出 TRIG 之间的间隔，确保 LT3750 完全停止开关。
+ * 绝对不能在充电过程中触发可控硅。
+ * 单位是【微秒】—— 不能用 vTaskDelay：CONFIG_FREERTOS_HZ=100，一个 tick 就是
+ * 10 ms，pdMS_TO_TICKS(5) 会被整除成 0，延时直接消失。所以这里走忙等。
+ * 物理上只需要超过 LT3750 的一个开关周期（约 19 µs）。
+ * 500 µs 留了 26 倍余量，同时把连发的单发开销从 5 ms 降到 0.5 ms。
+ * 再往下压意义不大，而且会侵蚀这个余量。 */
+#ifndef FENCE_BENCH_FIRE_SETTLE_US
+#define FENCE_BENCH_FIRE_SETTLE_US 500
+#endif
+
+/* TRIG 高电平时长（微秒）。PC817 的传输延时是十几 µs 量级，可控硅一旦擎住
+ * 就自己走完，C51 在 10 µs 内放空、电流归零自然关断。
+ * 200 µs 对 PC817 约 15 µs 的传输延时留了 13 倍余量。
+ * 如果连发中出现某发没打出去（表现为下一发充电异常快，因为电容没放空），
+ * 优先怀疑这个值，往回加到 500 µs 试。 */
+#ifndef FENCE_BENCH_FIRE_TRIG_US
+#define FENCE_BENCH_FIRE_TRIG_US 200
+#endif
+
+/* ---- 连发 `f burst` ---- */
+#ifndef FENCE_BENCH_BURST_MAX_SHOTS
+#define FENCE_BENCH_BURST_MAX_SHOTS 10
+#endif
+#ifndef FENCE_BENCH_BURST_DEFAULT_SHOTS
+#define FENCE_BENCH_BURST_DEFAULT_SHOTS 3
+#endif
+/* 默认节奏。第一次测连发用宽松的 100 ms，确认机制没问题再往下压。
+ * 目标是 10 ms/发（100 ms 打 10 发）。 */
+#ifndef FENCE_BENCH_BURST_DEFAULT_INTERVAL_MS
+#define FENCE_BENCH_BURST_DEFAULT_INTERVAL_MS 100
+#endif
+#ifndef FENCE_BENCH_BURST_MIN_INTERVAL_MS
+#define FENCE_BENCH_BURST_MIN_INTERVAL_MS 1
+#endif
+#ifndef FENCE_BENCH_BURST_MAX_INTERVAL_MS
+#define FENCE_BENCH_BURST_MAX_INTERVAL_MS 200
+#endif
+
 #ifndef FENCE_BENCH_TRIG_MAX_PULSES
 #define FENCE_BENCH_TRIG_MAX_PULSES 20
 #endif

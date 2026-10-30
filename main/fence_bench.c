@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #include "esp_console.h"
 #include "esp_log.h"
@@ -59,6 +60,7 @@ static int64_t s_armed_until_us = 0;
 /* 上次充电的结果，供 f status 回显 */
 static int      s_last_charge_ms   = -1;   /* 上次充电实际持续时间 */
 static int      s_last_done_us     = -1;   /* 上次 IO10 首次跳变的时刻 */
+static int      s_last_fire_us    = -1;   /* 上次 f fire 的充电耗时，-1 = 超时 */
 
 static void arm_set(bool on)
 {
@@ -107,6 +109,11 @@ static void cmd_status(void)
            FENCE_TRIG_PIN);
     printf("  IO%-2d C_DONE (原始)  : %d    (极性待实测确认，别信注释)\n",
            FENCE_CHARGE_DONE_PIN, gpio_get_level(FENCE_CHARGE_DONE_PIN));
+    if (s_last_fire_us >= 0) {
+        printf("  上次发射            : 充电耗时 %.2f ms%s\n",
+               (double)s_last_fire_us / 1000.0,
+               (s_last_fire_us < FENCE_BENCH_FIRE_MIN_MS * 1000) ? "（可疑，过早）" : "");
+    }
     if (s_last_charge_ms >= 0) {
         printf("\n  上次充电            : 窗口 %d ms", s_last_charge_ms);
         if (s_last_done_us >= 0) printf("，DONE 首次跳变 @ %.2f ms\n", (double)s_last_done_us / 1000.0);
@@ -314,6 +321,227 @@ static void cmd_hold(int argc, char **argv)
     printf("⚠ C51 仍然带电，约 14 秒后降到 10 V 以下。\n\n");
 }
 
+/* ================= 阶段 3：单发放电 =================
+ *
+ * 为什么要单独写一个充电函数而不复用 charge_once()：
+ * charge_once() 是诊断用的，固定跑满窗口、只记录 DONE 不作为。
+ * 发射前必须【确认充满才放】，所以这里用 DONE 驱动提前退出。
+ */
+
+/* 拉高 CHARGE，等 DONE 跌落（低 = 停止充电）或超时。
+ * 返回充电耗时(µs)；-1 表示整个窗口 DONE 都没跌落。
+ * 退出时 CHARGE 一定是低的。 */
+static int64_t charge_until_done(uint32_t max_ms)
+{
+    gpio_set_level(FENCE_TRIG_PIN, 0);          /* 充电期间绝不允许触发 */
+
+    int64_t t0     = esp_timer_get_time();
+    int64_t t_done = -1;
+
+    gpio_set_level(FENCE_CHARGE_EN_PIN, 1);
+    while ((esp_timer_get_time() - t0) < (int64_t)max_ms * 1000) {
+        if (gpio_get_level(FENCE_CHARGE_DONE_PIN) == 0) {
+            t_done = esp_timer_get_time() - t0;
+            break;
+        }
+        esp_rom_delay_us(50);
+    }
+    gpio_set_level(FENCE_CHARGE_EN_PIN, 0);     /* 无论如何，收尾必须拉低 */
+
+    return t_done;
+}
+
+/* 精确的毫秒级忙等。
+ * 不能用 vTaskDelay：CONFIG_FREERTOS_HZ = 100，一个 tick 就是 10 ms，
+ * pdMS_TO_TICKS(2) / pdMS_TO_TICKS(5) 都会被整除成 0，延时直接消失。
+ * 发射时序要的是百微秒到毫秒量级，只能忙等。 */
+static void delay_us_busy(uint32_t us)
+{
+    while (us >= 1000) { esp_rom_delay_us(1000); us -= 1000; }
+    if (us) esp_rom_delay_us(us);
+}
+
+/* 发射类命令的共同前置检查。通过返回 true。 */
+static bool fire_preflight(void)
+{
+    if (!charge_preflight()) return false;
+
+    /* 触发链路必须先通电 —— 这是整组命令里最重要的安全检查。
+     * 5V0_ISO 没开就去充电，会制造最危险的组合：
+     * C51 充到约 411 V，TRIG 发出去却驱动不了可控硅，
+     * 而命令正常结束，你会以为已经放电了。 */
+    if (!fence_iso_is_on()) {
+        printf("\n拒绝：5V0_ISO 没开，触发链路是死的。\n");
+        printf("  现在充电的话，C51 会充到约 411 V 却放不出去 ——\n");
+        printf("  而命令会正常结束，你会以为已经放电了。这是最危险的状态。\n");
+        printf("  先执行 `f iso 1`。\n\n");
+        return false;
+    }
+
+    /* 空闲时 DONE 应被 R81 拉高。已经是低的说明芯片在故障锁存态。 */
+    if (gpio_get_level(FENCE_CHARGE_DONE_PIN) == 0) {
+        printf("\n警告：充电前 IO%d (DONE) 已经是低电平。\n", FENCE_CHARGE_DONE_PIN);
+        printf("  正常空闲时它应该被 R81 拉高。芯片可能处于故障锁存态，结果不可信。\n\n");
+    }
+    return true;
+}
+
+/* 发一发：撤 CHARGE -> 等稳定 -> TRIG 脉冲 -> 收尾。
+ * 调用前 charge_until_done() 必须已经返回（CHARGE 已拉低）。 */
+static void do_trigger(void)
+{
+    gpio_set_level(FENCE_CHARGE_EN_PIN, 0);
+    delay_us_busy(FENCE_BENCH_FIRE_SETTLE_US);   /* 让 LT3750 彻底停止开关 */
+
+    gpio_set_level(FENCE_TRIG_PIN, 1);
+    delay_us_busy(FENCE_BENCH_FIRE_TRIG_US);
+    gpio_set_level(FENCE_TRIG_PIN, 0);
+
+    gpio_set_level(FENCE_CHARGE_EN_PIN, 0);
+}
+
+/* 把一次充电的结果翻译成人话。us < 0 表示超时。 */
+static const char *charge_verdict(int64_t us)
+{
+    if (us < 0)                                           return "超时未充满";
+    if (us < (int64_t)FENCE_BENCH_FIRE_MIN_MS * 1000)     return "过早(疑故障)";
+    return "充满";
+}
+
+static void cmd_fire(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!fire_preflight()) return;
+
+    printf("\n★★ 发射 —— J11/J4 输出 kV 级脉冲 ★★\n");
+    printf("   确认：输出端已接 500 ohm 负载、周围无人、单手操作\n\n");
+
+    int64_t us = charge_until_done(FENCE_BENCH_FIRE_CHARGE_MAX_MS);
+    s_last_fire_us = (int)us;
+
+    do_trigger();
+
+    printf("  [充电] %s", charge_verdict(us));
+    if (us >= 0) printf("，耗时 %.2f ms", (double)us / 1000.0);
+    printf("\n");
+    printf("  [发射] TRIG 高 %d us\n", FENCE_BENCH_FIRE_TRIG_US);
+    printf("  [结束] IO%d / IO%d 已拉低，C51 应已放空。\n\n",
+           FENCE_CHARGE_EN_PIN, FENCE_TRIG_PIN);
+}
+
+/* ---------------- 连发 ---------------- */
+
+typedef struct {
+    int32_t start_ms_x100;   /* 相对连发起点，单位 0.01 ms */
+    int32_t charge_us;       /* -1 = 超时 */
+} burst_rec_t;
+
+static void cmd_burst(int argc, char **argv)
+{
+    if (!fire_preflight()) return;
+
+    int shots    = (argc > 2) ? atoi(argv[2]) : FENCE_BENCH_BURST_DEFAULT_SHOTS;
+    int interval = (argc > 3) ? atoi(argv[3]) : FENCE_BENCH_BURST_DEFAULT_INTERVAL_MS;
+
+    if (shots < 1) shots = 1;
+    if (shots > FENCE_BENCH_BURST_MAX_SHOTS) {
+        printf("发数钳到上限 %d\n", FENCE_BENCH_BURST_MAX_SHOTS);
+        shots = FENCE_BENCH_BURST_MAX_SHOTS;
+    }
+    if (interval < FENCE_BENCH_BURST_MIN_INTERVAL_MS) interval = FENCE_BENCH_BURST_MIN_INTERVAL_MS;
+    if (interval > FENCE_BENCH_BURST_MAX_INTERVAL_MS) interval = FENCE_BENCH_BURST_MAX_INTERVAL_MS;
+
+    printf("\n★★ 连发 %d 发，节奏 %d ms ★★\n", shots, interval);
+    printf("   J11/J4 将连续输出 kV 脉冲。确认负载已接、周围无人。\n");
+    printf("   过程中不打印（串口一行就要几毫秒，会把节奏搅乱），结束后统一报告。\n\n");
+
+    burst_rec_t rec[FENCE_BENCH_BURST_MAX_SHOTS];
+    int     done_shots = 0;
+    bool    aborted    = false;
+    int64_t interval_us = (int64_t)interval * 1000;
+
+    /* ======== 以下这段不要插入任何 printf ======== */
+    int64_t t0 = esp_timer_get_time();
+    for (int i = 0; i < shots; i++) {
+        int64_t shot_t0 = esp_timer_get_time();
+        rec[i].start_ms_x100 = (int32_t)((shot_t0 - t0) / 10);
+
+        int64_t us = charge_until_done(FENCE_BENCH_FIRE_CHARGE_MAX_MS);
+        rec[i].charge_us = (us < 0) ? -1 : (int32_t)us;
+
+        do_trigger();
+        done_shots++;
+
+        /* 整发超时就停：否则每发要白等 2 秒，而且后面的数据没有意义 */
+        if (us < 0) { aborted = true; break; }
+
+        if (i < shots - 1) {
+            while ((esp_timer_get_time() - shot_t0) < interval_us) {
+                esp_rom_delay_us(50);
+            }
+        }
+    }
+    int64_t total_us = esp_timer_get_time() - t0;
+    /* ======== 时序敏感段结束 ======== */
+
+    /* ---- 报告 ---- */
+    printf("=== 连发结果 ===\n");
+    printf("  #    起始(ms)   充电(ms)   判定\n");
+    int32_t cmin = INT32_MAX, cmax = 0; int64_t csum = 0; int cok = 0;
+    for (int i = 0; i < done_shots; i++) {
+        printf("  %-2d  %8.2f   ", i + 1, (double)rec[i].start_ms_x100 / 100.0);
+        if (rec[i].charge_us < 0) {
+            printf("      --   %s\n", charge_verdict(-1));
+        } else {
+            printf("%8.2f   %s\n", (double)rec[i].charge_us / 1000.0,
+                   charge_verdict(rec[i].charge_us));
+            if (rec[i].charge_us < cmin) cmin = rec[i].charge_us;
+            if (rec[i].charge_us > cmax) cmax = rec[i].charge_us;
+            csum += rec[i].charge_us;
+            cok++;
+        }
+    }
+    printf("\n  总时长 %.2f ms", (double)total_us / 1000.0);
+    if (done_shots > 1) {
+        printf("，实际节奏 %.2f ms/发",
+               (double)total_us / 1000.0 / (double)(done_shots - 1));
+    }
+    printf("\n");
+
+    if (cok > 0) {
+        printf("  充电：平均 %.2f ms，最快 %.2f，最慢 %.2f\n",
+               (double)csum / cok / 1000.0,
+               (double)cmin / 1000.0, (double)cmax / 1000.0);
+
+        /* 充电时间逐发变长 = 电池扛不住了，这是连发最该盯的信号 */
+        if (cok >= 2 && rec[cok - 1].charge_us > rec[0].charge_us * 6 / 5) {
+            printf("\n  ⚠ 充电时间逐发变长（第 1 发 %.2f ms -> 第 %d 发 %.2f ms）。\n",
+                   (double)rec[0].charge_us / 1000.0, cok,
+                   (double)rec[cok - 1].charge_us / 1000.0);
+            printf("    这是电池/供电在连发中被拖垮的典型特征，发数再加会更明显。\n");
+        }
+
+        /* 按最慢一发推算能做到的最小节奏 */
+        double min_cadence = (double)cmax / 1000.0
+                           + (FENCE_BENCH_FIRE_SETTLE_US + FENCE_BENCH_FIRE_TRIG_US) / 1000.0;
+        printf("\n  按最慢一发推算的最小节奏 ≈ %.2f ms/发"
+               "（充电 %.2f + settle %.1f + trig %.1f）\n",
+               min_cadence, (double)cmax / 1000.0,
+               FENCE_BENCH_FIRE_SETTLE_US / 1000.0,
+               FENCE_BENCH_FIRE_TRIG_US / 1000.0);
+        printf("  -> 10 发大约需要 %.0f ms。目标若是 100 ms，%s\n",
+               min_cadence * 10,
+               (min_cadence * 10 <= 100.0) ? "目前够用。"
+                                           : "需要压缩 settle/trig 或加快充电。");
+    }
+
+    if (aborted) {
+        printf("\n  ⚠ 第 %d 发充电超时，连发已中止。\n", done_shots);
+    }
+    printf("\n");
+}
+
+
 static void cmd_help(void)
 {
     printf("\n电子围栏台架测试命令（阶段 1，D25 未焊）\n\n");
@@ -330,6 +558,14 @@ static void cmd_help(void)
     printf("                       打印 IO%d 的原始跳变时刻\n", FENCE_CHARGE_DONE_PIN);
     printf("  f hold [sec]         维持模式，默认 10 秒，上限 %d 秒\n", FENCE_BENCH_HOLD_MAX_S);
     printf("                       持续补电，方便万用表读稳 C51 电压\n");
+    printf("\n  --- 阶段 3（输出 kV，必须接负载）---\n");
+    printf("  f fire               单发：充满 -> 撤 CHARGE -> 触发可控硅放电\n");
+    printf("                       需要 5V0_ISO 已打开，否则拒绝执行\n");
+    printf("  f burst [n] [ms]     连发 n 发，节奏 ms；默认 %d 发 / %d ms\n",
+           FENCE_BENCH_BURST_DEFAULT_SHOTS, FENCE_BENCH_BURST_DEFAULT_INTERVAL_MS);
+    printf("                       上限 %d 发，节奏 %d~%d ms；结束后统一报告\n",
+           FENCE_BENCH_BURST_MAX_SHOTS, FENCE_BENCH_BURST_MIN_INTERVAL_MS,
+           FENCE_BENCH_BURST_MAX_INTERVAL_MS);
     printf("\n建议顺序：\n");
     printf("  1) f status                      —— 基线\n");
     printf("  2) f arm                         —— 解锁\n");
@@ -343,7 +579,13 @@ static void cmd_help(void)
     printf("  2) f arm; f charge 50            —— 第一次，很短。量 C51 两端\n");
     printf("  3) f charge 100 / 200 / 500      —— 逐步加长，画充电曲线\n");
     printf("  4) f arm; f hold 20              —— 维持住，读稳定值（预期约 405 V）\n");
-    printf("  5) f 12v 0; f safe               —— 收工，等 C51 自己泄放\n\n");
+    printf("  5) f 12v 0; f safe               —— 收工，等 C51 自己泄放\n");
+    printf("\n阶段 3（输出端 kV，J11/J4 必须接 500 ohm 假负载或放电间隙）：\n");
+    printf("  1) f 12v 1; f iso 1              —— 两条轨都要开\n");
+    printf("  2) f arm; f fire                 —— 单发\n");
+    printf("  3) f arm; f burst 3 100          —— 3 连发，宽松节奏\n");
+    printf("  4) f arm; f burst 3 20           —— 压缩节奏，看充电跟不跟得上\n");
+    printf("  5) f 12v 0; f iso 0; f safe      —— 收工\n\n");
 }
 
 /* ---------------- 命令入口 ---------------- */
@@ -376,6 +618,8 @@ static int cmd_fence(int argc, char **argv)
     else if (strcmp(sub, "trig")   == 0) cmd_trig(argc, argv);
     else if (strcmp(sub, "charge") == 0) cmd_charge(argc, argv);
     else if (strcmp(sub, "hold")   == 0) cmd_hold(argc, argv);
+    else if (strcmp(sub, "fire")   == 0) cmd_fire(argc, argv);
+    else if (strcmp(sub, "burst")  == 0) cmd_burst(argc, argv);
     else {
         printf("未知子命令 '%s'，`f help` 看用法。\n", sub);
     }
