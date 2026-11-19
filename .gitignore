@@ -1,0 +1,13 @@
+# ESP-IDF 构建产物
+build/
+_build_broken_*/
+
+# 本地杂项 / 备份
+_downloaded_dups/
+sdkconfig.bak*
+sdkconfig.old
+_sdkconfig.defaults.disabled
+
+# 编辑器
+.vscode/
+*.swp

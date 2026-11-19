@@ -322,7 +322,8 @@ esp_deep_sleep_start();     // 不返回，醒来从 app_main 重新开始
 - **`gnss_task` / `timer_module` / `motion_sensor_task` 每轮重新创建**，现在的 `gnss_task` 里有 `static` 状态机变量，复位后归零，逻辑上没问题。
 - **主循环那个每秒打印电池的 `while(1)` 要去掉**，否则永远走不到 deep sleep。
 - `CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND=y` 已经开着，deep sleep 时 GPIO 会被复位——**围栏那几个引脚必须确认掉电后是安全电平**（现在是纯 GPIO 输出，deep sleep 后浮空，靠外部下拉；下一版建议给 `Trig` 和 `C_EN` 加实体下拉电阻）。
-- IO0 双击手动上报在 deep sleep 期间失效。需要的话用 `esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0)` 让按键也能唤醒。
+- IO0 双击手动上报在 deep sleep 期间失效。~~需要的话用 `esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0)` 让按键也能唤醒。~~
+  **⚠ 作废 —— 别照做**：ext0 要 RTC_PERIPH 整晚带电，实测 +405 µA（112 → 550 µA），见 1.3 与 5.5。现在 `DEEPSLEEP_WAKE_ON_BUTTON = 0`。
 
 预期：休眠期从 59.6 mA 降到 0.07 mA。
 
