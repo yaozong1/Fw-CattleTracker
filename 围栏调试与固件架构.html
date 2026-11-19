@@ -1,0 +1,460 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>围栏调试与固件架构</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* 布局：单栏文档，固定内容宽度；数据用等宽，诊断值用色标 */
+:root{
+  --bg:#f7f8fa; --panel:#ffffff; --fg:#13181f; --muted:#5b6673; --line:#dde3ea;
+  --hv:#b45309;          /* 高压 / 注意 */
+  --sig:#0e7490;         /* 信号 / 已验证 */
+  --ok:#15803d; --warn:#b45309; --open:#6b7280;
+  --code-bg:#eef1f5;
+  --f-head:"Space Grotesk",system-ui,sans-serif;
+  --f-body:"Inter",system-ui,sans-serif;
+  --f-data:"JetBrains Mono",ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#10151b; --panel:#171e26; --fg:#e6ecf3; --muted:#93a1b1; --line:#283341;
+  --hv:#f0a53e; --sig:#38bdf8; --ok:#4ade80; --warn:#f0a53e; --open:#8b98a8;
+  --code-bg:#1d2630; color-scheme:dark;
+}}
+:root[data-theme="dark"]{
+  --bg:#10151b; --panel:#171e26; --fg:#e6ecf3; --muted:#93a1b1; --line:#283341;
+  --hv:#f0a53e; --sig:#38bdf8; --ok:#4ade80; --warn:#f0a53e; --open:#8b98a8;
+  --code-bg:#1d2630; color-scheme:dark;
+}
+
+body{background:var(--bg);color:var(--fg);font-family:var(--f-body);line-height:1.65;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:860px;margin:0 auto;
+  padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px));
+  padding-block:48px 72px}
+
+h1{font-family:var(--f-head);font-size:clamp(1.9rem,5vw,2.6rem);font-weight:700;
+  line-height:1.15;letter-spacing:-.02em;margin:0 0 10px;text-wrap:balance}
+.sub{color:var(--muted);font-size:1.02rem;margin:0 0 6px;max-width:60ch}
+.stamp{font-family:var(--f-data);font-size:.78rem;color:var(--muted);letter-spacing:.02em}
+
+h2{font-family:var(--f-head);font-size:1.35rem;font-weight:600;letter-spacing:-.01em;
+  margin:56px 0 6px;padding-top:22px;border-top:1px solid var(--line);text-wrap:balance}
+h2 .n{font-family:var(--f-data);font-size:.8rem;color:var(--sig);display:block;
+  font-weight:500;letter-spacing:.08em;margin-bottom:6px}
+h3{font-family:var(--f-head);font-size:1.03rem;font-weight:600;margin:30px 0 4px}
+p{margin:10px 0}
+a{color:var(--sig)}
+code{font-family:var(--f-data);font-size:.86em;background:var(--code-bg);
+  padding:.1em .38em;border-radius:3px}
+strong{font-weight:600}
+.lead{font-size:1.06rem}
+
+/* 结论条 */
+.verdict{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:26px 0}
+.verdict div{background:var(--panel);padding:14px 16px;min-width:0}
+.verdict dt{font-size:.74rem;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;
+  margin-bottom:5px}
+.verdict dd{margin:0;font-family:var(--f-data);font-size:1.22rem;font-weight:500;
+  font-variant-numeric:tabular-nums}
+.verdict .u{font-size:.78rem;color:var(--muted);margin-left:2px}
+
+/* 表 */
+.tw{overflow-x:auto;margin:16px 0;border:1px solid var(--line);border-radius:6px}
+table{border-collapse:collapse;width:100%;font-size:.9rem;background:var(--panel)}
+th{text-align:left;font-weight:600;font-size:.76rem;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+td.n{font-family:var(--f-data);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* 状态点 */
+.tag{display:inline-block;font-family:var(--f-data);font-size:.72rem;padding:.14em .5em;
+  border-radius:3px;border:1px solid currentColor;white-space:nowrap}
+.t-ok{color:var(--ok)} .t-warn{color:var(--warn)} .t-open{color:var(--open)}
+
+/* 图 */
+figure{margin:28px 0;padding:0}
+figure svg{display:block;width:100%;max-width:100%;height:auto;color:var(--fg)}
+figcaption{font-size:.84rem;color:var(--muted);margin-top:10px;line-height:1.5}
+
+/* 卡片组 */
+.mods{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:10px;margin:18px 0}
+.mod{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px;min-width:0}
+.mod b{font-family:var(--f-data);font-size:.84rem;font-weight:500;display:block;margin-bottom:3px;
+  color:var(--sig);overflow-wrap:anywhere}
+.mod span{font-size:.85rem;color:var(--muted);line-height:1.45}
+
+/* 提示块 */
+.note{border-left:3px solid var(--hv);background:var(--panel);padding:12px 16px;
+  margin:18px 0;border-radius:0 5px 5px 0;font-size:.93rem}
+.note b{color:var(--hv)}
+
+.k-sig{stroke:var(--sig)}.k-sigf{fill:var(--sig)}
+.k-hv{stroke:var(--hv)}.k-hvf{fill:var(--hv)}
+ul{margin:10px 0;padding-left:1.15em}
+li{margin:5px 0}
+</style>
+
+<div class="wrap">
+
+<h1>围栏调试与固件架构</h1>
+<p class="sub">这一轮做了什么、现在的固件长什么样。写给几个月后忘记细节的自己。</p>
+<p class="stamp">Cattle_T · ESP32-S3 · ESP-IDF v5.3.2 · 2026-11</p>
+
+<dl class="verdict">
+  <div><dt>储能电容</dt><dd>411<span class="u">V</span></dd></div>
+  <div><dt>充电耗时</dt><dd>4.84<span class="u">ms</span></dd></div>
+  <div><dt>负载端峰值</dt><dd>2000<span class="u">V</span></dd></div>
+  <div><dt>单发能量</dt><dd>25<span class="u">mJ</span></dd></div>
+  <div><dt>10 连发</dt><dd>50<span class="u">ms</span></dd></div>
+  <div><dt>深睡</dt><dd>150<span class="u">µA</span></dd></div>
+</dl>
+
+<h2><span class="n">01</span>这一轮的三条线</h2>
+
+<p class="lead">三件事并行推进，彼此独立但共用同一套引脚安全规则。</p>
+
+<h3>运动驱动的上报频率</h3>
+<p>把固定周期改成「醒来看一眼，只有真动了才开 GNSS」。核心难点不在流程，在<strong>判据</strong>——
+最初用加速度矢量的模长偏离 <code>|‖a‖ − 1g|</code>，结果用力晃板子只读到 4% 活动占比。
+原因是模长是旋转不变量：翻转板子时重力只在三轴之间重新分配，模长始终 ≈1 g。
+而牛低头、甩头、走路全都以旋转为主，这个判据会系统性漏判。</p>
+
+<h3>电子围栏高压块点亮</h3>
+<p>从零开始带机：先在 D25 未焊的状态下验证控制链路，再焊上 D25 验证充电，
+最后接 500 Ω 标准负载验证放电和连发。过程中找出一个贴装错误、两个固件 bug。</p>
+
+<h3>顺带修掉的周边问题</h3>
+<p>深睡唤醒后的 GPIO 毛刺、<code>gpio_reset_pin()</code> 的隐式上拉、
+<code>pdMS_TO_TICKS()</code> 的整除归零——都是"看起来能跑，实际上在靠运气"的那一类。</p>
+
+<h2><span class="n">02</span>固件的三种形态</h2>
+
+<p>同一份代码，靠 <code>hardware_config.h</code> 顶部的两个开关切换。
+<code>main.c</code> 里是一个三分支。</p>
+
+<div class="tw"><table>
+<thead><tr><th>开关</th><th>形态</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td class="n">FENCE_BENCH = 1</td><td>围栏台架</td>
+    <td>串口 <code>f</code> 命令集，手动充放电。不启动 GNSS / MQTT / 运动传感器，不进深睡</td></tr>
+<tr><td class="n">SELFTEST = 1</td><td>产测自检</td>
+    <td><code>eg915_selftest.c</code>，IO0 双击触发</td></tr>
+<tr><td class="n">两个都 0</td><td><strong>生产固件</strong></td>
+    <td>运动驱动的定位上报循环</td></tr>
+</tbody></table></div>
+
+<div class="note"><b>当前仓库状态：</b><code>FENCE_BENCH = 1</code>。
+现在编出来的是台架固件，不是生产固件。下一轮迭代前记得改回 <code>0</code>。</div>
+
+<h3>模块地图</h3>
+<div class="mods">
+  <div class="mod"><b>tracking_policy.c</b><span>运动判定的纯决策函数 + RTC 状态。无副作用，好测</span></div>
+  <div class="mod"><b>motion_sensor.c</b><span>LIS2DH12：睡眠布防、锁存读取、5 秒采样</span></div>
+  <div class="mod"><b>gnss_module.c</b><span>LC760Z：NMEA 解析、Backup 进出</span></div>
+  <div class="mod"><b>mqtt_module.c</b><span>EG800 AT 收发、注网、MQTT 发布。最大的文件</span></div>
+  <div class="mod"><b>gpio_module.c</b><span>引脚初始化、围栏安全态、电源控制</span></div>
+  <div class="mod"><b>fence_bench.c</b><span>围栏台架控制台。仅 FENCE_BENCH=1 编译</span></div>
+</div>
+
+<h2><span class="n">03</span>生产固件的一轮</h2>
+
+<p>每 30 秒唤醒一次。<strong>深睡等同复位</strong>——RAM 全丢，只有 <code>RTC_DATA_ATTR</code>
+里的跨轮状态活下来。所以每轮都要重新 init 一遍所有外设。</p>
+
+<figure>
+<svg viewBox="0 0 780 468" role="img" aria-label="唤醒流程图：定时器唤醒后读加速度计锁存位，锁存为零直接判定静止并睡下，锁存为一则做五秒采样，按平均帧差分为有动作和存疑两种结果">
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+  </marker>
+</defs>
+<g font-family="Inter, system-ui, sans-serif" font-size="12.5" fill="currentColor">
+
+  <rect x="20" y="16" width="150" height="40" rx="5" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".55"/>
+  <text x="95" y="34" text-anchor="middle">深睡 30 s</text>
+  <text x="95" y="49" text-anchor="middle" font-size="11" opacity=".6">~150 µA</text>
+
+  <line x1="95" y1="56" x2="95" y2="86" stroke="currentColor" stroke-width="1.3" marker-end="url(#ar)"/>
+  <text x="105" y="76" font-size="11" opacity=".65">定时器</text>
+
+  <rect x="20" y="88" width="150" height="56" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="95" y="107" text-anchor="middle">唤醒 → GPIO init</text>
+  <text x="95" y="124" text-anchor="middle" font-size="11" opacity=".7">先写电平，再切方向</text>
+  <text x="95" y="138" text-anchor="middle" font-size="11" opacity=".7">~0.4 s</text>
+
+  <line x1="95" y1="144" x2="95" y2="174" stroke="currentColor" stroke-width="1.3" marker-end="url(#ar)"/>
+
+  <rect x="20" y="176" width="150" height="56" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="95" y="195" text-anchor="middle">读 INT1_SRC</text>
+  <text x="95" y="212" text-anchor="middle" font-size="11" opacity=".7">必须在任何</text>
+  <text x="95" y="226" text-anchor="middle" font-size="11" opacity=".7">重配置之前</text>
+
+  <path d="M170 204 L214 204" stroke="currentColor" stroke-width="1.3" fill="none"/>
+  <path d="M214 204 L214 60 L256 60" stroke="currentColor" stroke-width="1.3" fill="none" marker-end="url(#ar)"/>
+  <path d="M214 204 L214 300 L256 300" stroke="currentColor" stroke-width="1.3" fill="none" marker-end="url(#ar)"/>
+  <text x="222" y="130" font-size="11" opacity=".75">锁存 = 0</text>
+  <text x="222" y="270" font-size="11" opacity=".75">锁存 = 1</text>
+
+  <rect x="258" y="36" width="168" height="48" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="342" y="56" text-anchor="middle">确定静止</text>
+  <text x="342" y="73" text-anchor="middle" font-size="11" opacity=".7">跳过采样 · 全轮 2.2 s</text>
+
+  <rect x="258" y="276" width="168" height="48" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="342" y="296" text-anchor="middle">5 秒采样</text>
+  <text x="342" y="313" text-anchor="middle" font-size="11" opacity=".7">100 Hz ODR · 20 ms 取样</text>
+
+  <path d="M426 300 L466 300" stroke="currentColor" stroke-width="1.3" fill="none"/>
+  <path d="M466 300 L466 192 L512 192" stroke="currentColor" stroke-width="1.3" fill="none" marker-end="url(#ar)"/>
+  <path d="M466 300 L466 396 L512 396" stroke="currentColor" stroke-width="1.3" fill="none" marker-end="url(#ar)"/>
+  <text x="474" y="246" font-size="11" opacity=".75">≥ 20 mg</text>
+  <text x="474" y="362" font-size="11" opacity=".75">&lt; 20 mg</text>
+
+  <rect x="514" y="168" width="246" height="48" rx="5" fill="none" class="k-sig" stroke-width="1.6"/>
+  <text x="637" y="188" text-anchor="middle" class="k-sigf" font-weight="600">有动作</text>
+  <text x="637" y="205" text-anchor="middle" font-size="11" opacity=".75">开 GNSS ≤90 s → 上报 ~10 s</text>
+
+  <rect x="514" y="372" width="246" height="48" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="637" y="392" text-anchor="middle">存疑</text>
+  <text x="637" y="409" text-anchor="middle" font-size="11" opacity=".7">睡眠期动过，但快照静止 · 全轮 8 s</text>
+
+  <path d="M637 216 L637 244 L200 244 L200 440 L95 440 L95 440" stroke="currentColor"
+        stroke-width="1.1" fill="none" stroke-dasharray="4 4" opacity=".55"/>
+  <path d="M342 84 L342 440 L100 440" stroke="currentColor" stroke-width="1.1" fill="none"
+        stroke-dasharray="4 4" opacity=".55"/>
+  <path d="M637 420 L637 440 L100 440" stroke="currentColor" stroke-width="1.1" fill="none"
+        stroke-dasharray="4 4" opacity=".55" marker-end="url(#ar)"/>
+  <text x="300" y="456" font-size="11" opacity=".6">三条路径都回到：布防加速度计 → 深睡</text>
+</g>
+</svg>
+<figcaption>一轮的三种结局。锁存位为 0 时直接跳过 5 秒采样，这是静止轮只要 2.2 秒的原因。</figcaption>
+</figure>
+
+<h3>运动判据</h3>
+<p>主判据是<strong>相邻两帧的加速度矢量差</strong> <code>‖a[n] − a[n−1]‖</code> 在 5 秒窗口内的平均值。
+旋转会让重力在三轴之间转移，模长不变但帧差很大——这正是甩头和走路要抓的信号。</p>
+
+<div class="tw"><table>
+<thead><tr><th>层</th><th>谁在跑</th><th>阈值</th><th>功耗</th></tr></thead>
+<tbody>
+<tr><td>睡眠期硬件锁存</td><td>LIS2DH12 自己，10 Hz 低功耗</td><td class="n">96 mg</td><td class="n">3 µA</td></tr>
+<tr><td>醒来后软件采样</td><td>MCU，100 Hz ODR / 20 ms 取样</td><td class="n">20 mg 平均帧差</td><td class="n">40 mA × 5 s</td></tr>
+</tbody></table></div>
+
+<div class="note"><b>为什么不用中断唤醒：</b>ESP32-S3 任何 RTC 域唤醒源
+（<code>ext0</code> 或 <code>gpio_hold_en</code>）都要求 RTC_PERIPH 整个休眠期供电，
+实测 <strong>+405 µA</strong>——比整机深睡还高一倍半。所以坚持定时唤醒 + 读锁存位，
+中断线 IO17 不参与唤醒。深睡期间的引脚电平全靠板上电阻保证。</div>
+
+<h3>续航</h3>
+<p>30 秒是调试值，<strong>也是现在最大的耗电来源</strong>。全静止时每天醒 2880 次，
+光是"醒来看一眼"就吃掉 70 mAh——是深睡底噪的 20 倍。</p>
+
+<div class="tw"><table>
+<thead><tr><th>周期</th><th>唤醒开销</th><th>深睡</th><th>合计</th><th>1800 mAh 续航</th></tr></thead>
+<tbody>
+<tr><td class="n">30 s（现在）</td><td class="n">70.4 mAh</td><td class="n">3.6</td><td class="n">74 mAh/天</td><td class="n">24 天</td></tr>
+<tr><td class="n">60 s</td><td class="n">35.2 mAh</td><td class="n">3.6</td><td class="n">39 mAh/天</td><td class="n">46 天</td></tr>
+<tr><td class="n">300 s</td><td class="n">7.0 mAh</td><td class="n">3.6</td><td class="n">11 mAh/天</td><td class="n">170 天</td></tr>
+</tbody></table></div>
+<p>一个有动作的轮次约 <strong>2.5 mAh</strong>，所以上报次数一多，周期的优势会被抹平。
+两件事都要管。</p>
+
+<h2><span class="n">04</span>围栏高压块</h2>
+
+<p>电容充电 + 可控硅放电。和市面上样品用的开环升压不同，
+这个结构的能量、间隔、发数都是可设的。</p>
+
+<figure>
+<svg viewBox="0 0 780 300" role="img" aria-label="围栏高压链路图：电池经 LT3750 和变压器给储能电容充电，电容经脉冲变压器和可控硅放电到电极，图中标出三道互锁">
+<defs>
+  <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+  </marker>
+</defs>
+<g font-family="Inter, system-ui, sans-serif" font-size="12" fill="currentColor">
+
+  <rect x="16" y="86" width="86" height="42" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="59" y="104" text-anchor="middle">VBAT</text>
+  <text x="59" y="120" text-anchor="middle" font-size="10.5" opacity=".65">峰值 6.5 A</text>
+
+  <line x1="102" y1="107" x2="140" y2="107" stroke="currentColor" stroke-width="1.3" marker-end="url(#ar2)"/>
+
+  <rect x="142" y="80" width="106" height="54" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="195" y="100" text-anchor="middle">LT3750</text>
+  <text x="195" y="116" text-anchor="middle" font-size="10.5" opacity=".65">+ Q2 + U7 1:10</text>
+  <text x="195" y="130" text-anchor="middle" font-size="10.5" opacity=".65">VCC ← 12 V</text>
+
+  <line x1="248" y1="107" x2="288" y2="107" stroke="currentColor" stroke-width="1.3" marker-end="url(#ar2)"/>
+  <text x="268" y="98" text-anchor="middle" font-size="10.5" opacity=".65">D26</text>
+
+  <rect x="290" y="80" width="106" height="54" rx="5" fill="none" class="k-hv" stroke-width="1.6"/>
+  <text x="343" y="100" text-anchor="middle" class="k-hvf" font-weight="600">C51</text>
+  <text x="343" y="116" text-anchor="middle" font-size="10.5" opacity=".75">390 nF / 630 V</text>
+  <text x="343" y="130" text-anchor="middle" font-size="10.5" class="k-hvf">411 V · 33 mJ</text>
+
+  <line x1="396" y1="107" x2="436" y2="107" stroke="currentColor" stroke-width="1.3" marker-end="url(#ar2)"/>
+
+  <rect x="438" y="80" width="106" height="54" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="491" y="100" text-anchor="middle">J2 EF25</text>
+  <text x="491" y="116" text-anchor="middle" font-size="10.5" opacity=".65">1:10 脉冲变压器</text>
+  <text x="491" y="130" text-anchor="middle" font-size="10.5" opacity=".65">g = 0.483</text>
+
+  <line x1="544" y1="107" x2="584" y2="107" stroke="currentColor" stroke-width="1.3" marker-end="url(#ar2)"/>
+
+  <rect x="586" y="80" width="106" height="54" rx="5" fill="none" class="k-hv" stroke-width="1.6"/>
+  <text x="639" y="100" text-anchor="middle" class="k-hvf" font-weight="600">电极</text>
+  <text x="639" y="116" text-anchor="middle" font-size="10.5" opacity=".75">2000 V 带载</text>
+  <text x="639" y="130" text-anchor="middle" font-size="10.5" opacity=".75">4110 V 开路</text>
+
+  <path d="M491 134 L491 176" stroke="currentColor" stroke-width="1.3" fill="none" marker-end="url(#ar2)"/>
+  <rect x="424" y="178" width="134" height="40" rx="5" fill="none" stroke="currentColor" stroke-width="1.3"/>
+  <text x="491" y="195" text-anchor="middle">Q7 BT151 可控硅</text>
+  <text x="491" y="211" text-anchor="middle" font-size="10.5" opacity=".65">← 光耦 ← IO13</text>
+
+  <text x="16" y="256" font-size="11.5" font-weight="600" opacity=".8">三道物理互锁 —— 任何一道断开，高压链路就是死的</text>
+  <g font-size="11" opacity=".78">
+    <text x="16" y="276">① D25 未焊 → 12 V 轨为 0 → LT3750 无 VCC</text>
+    <text x="300" y="276">② IO47 低 → 12 V 关（R77 下拉）</text>
+    <text x="540" y="276">③ IO12 低 → 5V_ISO 关（R63 下拉）</text>
+  </g>
+</g>
+</svg>
+<figcaption>三道互锁让阶段 1 的控制链路验证可以在零高压风险下完成——这是整个带机顺序的基础。</figcaption>
+</figure>
+
+<h3>单发时序</h3>
+<p>固件对 C51 的电压是瞎的（泄放串上没有 ADC 抽头），唯一的高压侧信号是 DONE。
+所以整个发射时序由 DONE 驱动，而不是定时。</p>
+
+<figure>
+<svg viewBox="0 0 780 262" role="img" aria-label="单发时序波形：CHARGE 拉高后电容电压爬升，DONE 在 4.84 毫秒跌落标志充满，撤掉 CHARGE 等 500 微秒后发出 200 微秒的触发脉冲">
+<g font-family="Inter, system-ui, sans-serif" font-size="11.5" fill="currentColor">
+  <line x1="150" y1="28" x2="150" y2="214" stroke="currentColor" stroke-width="1" opacity=".25"/>
+  <line x1="560" y1="28" x2="560" y2="214" stroke="currentColor" stroke-width="1" opacity=".25"/>
+
+  <text x="12" y="48" font-family="JetBrains Mono, monospace" font-size="11">CHARGE</text>
+  <path d="M60 56 L150 56 L150 34 L560 34 L560 56 L740 56" fill="none" stroke="currentColor" stroke-width="1.8"/>
+
+  <text x="12" y="104" font-family="JetBrains Mono, monospace" font-size="11">DONE</text>
+  <path d="M60 90 L560 90 L560 112 L700 112 L700 90 L740 90" fill="none" class="k-sig" stroke-width="1.8"/>
+  <text x="566" y="130" font-size="11" class="k-sigf">跌落 = 停止充电</text>
+
+  <text x="12" y="166" font-family="JetBrains Mono, monospace" font-size="11">C51</text>
+  <path d="M60 172 C 300 172, 430 128, 560 124 L560 124 L600 172 L740 172"
+        fill="none" class="k-hv" stroke-width="1.8"/>
+  <text x="430" y="118" font-size="11" class="k-hvf">411 V</text>
+
+  <text x="12" y="212" font-family="JetBrains Mono, monospace" font-size="11">TRIG</text>
+  <path d="M60 214 L596 214 L596 196 L604 196 L604 214 L740 214" fill="none" stroke="currentColor" stroke-width="1.8"/>
+
+  <g font-size="10.5" opacity=".7">
+    <text x="355" y="240" text-anchor="middle">充电 4.84 ms（由 DONE 决定，不是定时）</text>
+    <text x="578" y="254" text-anchor="middle">settle 500 µs</text>
+    <text x="680" y="240">TRIG 200 µs</text>
+  </g>
+  <line x1="150" y1="232" x2="340" y2="232" stroke="currentColor" stroke-width="1" opacity=".4"/>
+  <line x1="372" y1="232" x2="560" y2="232" stroke="currentColor" stroke-width="1" opacity=".4"/>
+</g>
+</svg>
+<figcaption>节奏不是写死的，是量出来的：充电多久由 DONE 说了算，所以 10 连发的间隔完全相同就等于十次充电耗时完全相同。</figcaption>
+</figure>
+
+<div class="note"><b>DONE 的歧义：</b>它拉低有两种原因——到达目标电压，或故障（UVLO / 热关断）。
+固件分不清，所以用<strong>最短合理充电时间</strong>判据：充到 411 V 至少需要 156 个开关周期 ≈ 2.54 ms，
+早于 2 ms 的 DONE 一律判为异常停机。这个判据顺带还是个<strong>哑火探测器</strong>——
+可控硅没擎住的话电容没放空，下一发的 DONE 会几乎立刻跌落。
+<strong>改了 R66 或目标电压，必须同步重算这个值。</strong></div>
+
+<h3>验收数据</h3>
+<div class="tw"><table>
+<thead><tr><th>项</th><th>实测</th><th>理论 / 规格书</th><th></th></tr></thead>
+<tbody>
+<tr><td>C51 充电电压</td><td class="n">411 V</td><td class="n">411 V</td><td><span class="tag t-ok">对上</span></td></tr>
+<tr><td>充电耗时</td><td class="n">4.84 ms</td><td class="n">3.3 ms</td><td><span class="tag t-warn">偏慢 46%</span></td></tr>
+<tr><td>负载端峰值</td><td class="n">~2000 V</td><td class="n">1984 V</td><td><span class="tag t-ok">对上</span></td></tr>
+<tr><td>脉宽</td><td class="n">~10 µs</td><td class="n">FW50 4.1 µs</td><td><span class="tag t-ok">对上</span></td></tr>
+<tr><td>单发能量</td><td class="n">—</td><td class="n">25 mJ</td><td><span class="tag t-ok">交叉验证</span></td></tr>
+<tr><td>10 连发</td><td class="n">~50 ms</td><td class="n">需求 100 ms</td><td><span class="tag t-ok">余量 2×</span></td></tr>
+</tbody></table></div>
+
+<p>测试负载是 <strong>500 Ω</strong>（IEC 60335-2-76 标准测试负载）。
+负载端只有 2000 V 而不是开路的 4110 V，不是损耗，是阻尼谐振的峰值因子
+<code>g = 0.483</code>——脉宽由 <code>√(L_lk × C_p)</code> 决定，不是 <code>R_ref × C</code>。</p>
+
+<h2><span class="n">05</span>踩过的坑</h2>
+
+<p>这一节是整份文档里最值钱的部分。四个都属于"看起来能跑，实际在靠运气"。</p>
+
+<h3>D25 / D26 贴反 ——  找了最久的那个</h3>
+<p>两颗都是 SMA 封装。D26（反激次级整流）该是 <strong>US1M 1000 V</strong>，实际贴成了
+<strong>SS14 40 V 肖特基</strong>。反压 450 V 打在 40 V 管上，反向击穿把输出钳在 40 V，
+而且加大限流完全无效——多余的电流全变成那颗管子的热。</p>
+<p>反过来 D25 位置贴成 US1M 却<strong>毫无症状</strong>（只是 Vf 高一点），
+所以 12 V 轨一切正常，排查时一直往别的方向找。</p>
+<div class="note">判别只要十秒，不用拆：万用表二极管档量正向压降。
+<strong>肖特基 0.2~0.3 V，超快恢复硅管 0.6~0.7 V。</strong></div>
+
+<h3>gpio_reset_pin() 会打开内部上拉</h3>
+<p>它的实现是「输入 + 使能内部上拉(~45 kΩ)」。对 IO9（LT3750 的 CHARGE）和
+IO13（围栏触发）这种没有外部下拉的"动作"脚，那一瞬间等于主动置位。
+启动日志里的 <code>GPIO[9] ... Pullup: 1</code> 就是证据。</p>
+
+<h3>pdMS_TO_TICKS() 整除成 0</h3>
+<p><code>CONFIG_FREERTOS_HZ = 100</code>，一个 tick 就是 10 ms。
+<code>pdMS_TO_TICKS(5)</code> 和 <code>pdMS_TO_TICKS(2)</code> 都是 <strong>0</strong>。
+发射时序里"撤 CHARGE 后等 5 ms"和"TRIG 高 2 ms"全都退化成了一次 taskYIELD。
+第一发成功纯属光耦和可控硅恰好够快。</p>
+
+<h3>深睡唤醒后的 GPIO 毛刺</h3>
+<p>输出锁存器在唤醒后复位为 0。先切方向再写电平，引脚会先输出一次低电平——
+这曾经让每次唤醒都把 GNSS 电源循环一次，表现为"第二轮睡眠停在 40 mA"。
+规则：<strong>先写电平，再切方向。</strong></p>
+
+<h2><span class="n">06</span>一条方法论</h2>
+
+<p class="lead">围栏电路不能用程控电源做台架测试。</p>
+<p>充电瞬间峰值初级电流 6.5 A，平均 3 A，整个过程只有 3~5 ms。
+程控电源在三个维度上都跟不上：引线电感（1 米线约 2 µH，
+<code>L·di/dt</code> 就是 0.8 V 跌落，而直流测线阻完全看不出来）、
+CC 模式恢复（毫秒级）、环路带宽（1~10 ms，比整个充电过程还长）。</p>
+
+<div class="tw"><table>
+<thead><tr><th>供电</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td class="n">程控电源 4.1 V</td><td>失败——VTRANS 跌破 3 V，UVLO 停机，C51 只到 220 V</td></tr>
+<tr><td class="n">程控电源 4.3 V</td><td>成功——多出的 0.2 V 补偿了电源自身的跌落</td></tr>
+<tr><td class="n">电池 4.0 V</td><td><strong>成功</strong>——电压比 4.1 V 还低</td></tr>
+</tbody></table></div>
+
+<p>电压最低的那个反而成功。LT3750 的 VTRANS 下限约 3 V，
+而 <strong>UVLO 看的是瞬时谷底，不是平均值</strong>——万用表读的平均值完全看不出问题。</p>
+
+<h2><span class="n">07</span>还没做的</h2>
+
+<div class="tw"><table>
+<thead><tr><th>项</th><th>说明</th><th></th></tr></thead>
+<tbody>
+<tr><td>心跳机制</td><td><code>do_gnss = 有动作 || 冷启动</code>，没有心跳。长时间不动的牛会完全静默，后台分不清"没动"和"设备挂了"。N 待定</td><td><span class="tag t-open">待定</span></td></tr>
+<tr><td>低温 / 老化电池边界</td><td>电池串 100 / 220 mΩ 跑 10 连发，找失效点。内阻 150~300 mΩ 是老化 + 0 °C 的典型值</td><td><span class="tag t-open">待测</span></td></tr>
+<tr><td>运动阈值现场标定</td><td><code>MOTION_MEAN_DELTA_TH_MG = 20</code> 是按手持晃动定的，要挂到真牛身上调</td><td><span class="tag t-open">待测</span></td></tr>
+<tr><td>周期 30 s → 几分钟</td><td>调试值，出货前必须定。零成本，收益最大</td><td><span class="tag t-open">待定</span></td></tr>
+<tr><td>分区表改双 OTA 槽</td><td>现在是 single-app + 2 MB 配置。改了要有线全擦重烧一次</td><td><span class="tag t-open">未开始</span></td></tr>
+<tr><td>蜂窝 OTA / BLE / Flutter App</td><td>方案已定，代码未写</td><td><span class="tag t-open">未开始</span></td></tr>
+<tr><td>高压侧电压采样</td><td>加 3.3M + 10k 分压到 ADC，固件就能自己知道充到多少伏</td><td><span class="tag t-open">下一版</span></td></tr>
+</tbody></table></div>
+
+<h3>余量现状</h3>
+<div class="tw"><table>
+<thead><tr><th>项</th><th>值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>di/dt</td><td class="n">43.4 / 50 A/µs</td><td>只剩 13% 余量，动 C_p 或绕法时要盯</td></tr>
+<tr><td>λ 安全系数</td><td class="n">1.60</td><td>健康</td></tr>
+<tr><td>C51 耐压降额</td><td class="n">411 / 630 V</td><td>65%</td></tr>
+<tr><td>连发时间预算</td><td class="n">50 / 100 ms</td><td>余量 2×，R66 还有往上调的空间换电池裕量</td></tr>
+</tbody></table></div>
+
+</div>
+
+</body></html>
