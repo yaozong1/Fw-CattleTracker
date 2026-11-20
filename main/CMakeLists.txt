@@ -12,6 +12,7 @@ idf_component_register(
               "timer_module.c"
               "tracking_policy.c"
               "fence_bench.c"
+              "p0_bench.c"
        INCLUDE_DIRS ""
 )
 

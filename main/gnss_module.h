@@ -73,6 +73,14 @@ void gnss_parse_and_log_rmc(const char* nmea);
 void gnss_parse_and_log_gga(const char* nmea);
 void gnss_parse_and_log_gsa(const char* nmea);
 
+// 专有语句（$P 开头，如 $PQTM…/$PAIR…）旁路回调。传 NULL 取消。
+// 在 gnss_task 上下文里调用，回调必须很轻。
+typedef void (*gnss_prop_hook_t)(const char *line);
+void gnss_set_prop_hook(gnss_prop_hook_t hook);
+
+// NMEA 行计数（gnss_task 每收完一行 +1），用来判断模组是醒是睡
+extern volatile uint32_t gnss_lines_seen;
+
 // GNSS任务
 void gnss_task_stop_request(void);   // 让 gnss_task 自行退出（调试保持模式）
 void gnss_task(void* pv);

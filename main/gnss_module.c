@@ -183,6 +183,11 @@ void gnss_send_nmea(const char* sentence)
  *   $PAIR001,<cmd>,<result>   模组对以上命令的 ACK，result 0 = OK
  * ============================================================ */
 
+/* 专有语句（$P 开头）的旁路回调，台架测试固件用来原样打印模组的应答。
+ * 在 gnss_task 的上下文里调用，回调里只能做很轻的事（打印一行）。 */
+static gnss_prop_hook_t s_prop_hook = NULL;
+void gnss_set_prop_hook(gnss_prop_hook_t hook) { s_prop_hook = hook; }
+
 // $PAIR001 ACK 捕获（由 gnss_task 的行解析写入）
 static volatile int  gnss_pair_ack_cmd    = -1;
 static volatile int  gnss_pair_ack_result = -1;
@@ -1057,6 +1062,7 @@ void gnss_task(void* pv)
                                 gnss_prop_count++;
                                 strncpy(gnss_last_prop, line, sizeof(gnss_last_prop) - 1);
                                 gnss_last_prop[sizeof(gnss_last_prop) - 1] = '\0';
+                                if (s_prop_hook) { s_prop_hook(line); }
                                 if (strncmp(line, "$PMTK", 5) == 0) { gnss_seen_pmtk = true; }
                                 else if (strncmp(line, "$PAIR", 5) == 0) { gnss_seen_pair = true; }
                                 else if (strncmp(line, "$PCAS", 5) == 0) { gnss_seen_pcas = true; }
