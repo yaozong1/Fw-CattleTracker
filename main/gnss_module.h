@@ -14,6 +14,7 @@ typedef struct {
     double spd_kn;    // 节
     double crs_deg;   // 航向角
     char   time_utc[16]; // hhmmss.sss（原样保存）
+    char   date_utc[8];  // ddmmyy（RMC 字段 9，原样保存）
 } gnss_location_t;
 
 // GNSS状态变量（只读）
@@ -22,6 +23,8 @@ extern volatile int   gnss_fix_q;
 extern volatile int   gnss_dim;
 extern volatile int   gnss_sats;
 extern volatile float gnss_hdop;
+extern volatile float gnss_alt_m;
+extern volatile bool  gnss_alt_valid;
 extern volatile bool  gnss_rmc_valid;
 extern volatile bool  gnss_seen_rmc;
 extern volatile bool  gnss_seen_gga;

@@ -5,38 +5,47 @@ ESP32-S3 牛羊项圈：GNSS 定位 + LTE 上报 + 电子围栏高压块。
 
 > 新会话从这里开始。按需读第 6 节的文档索引，不用一次全读。
 >
-> **最后核对：2026-11-19 / `646af57`**（本文件的事实已逐条对过代码）
+> **最后核对：2026-11-20 / 分支 `p1-protocol`**（P1 第一步写完后更新）
 
 ---
 
 ## 1. ⚠ 当前仓库状态
 
-**`hardware_config.h` 里 `FENCE_BENCH = 1`** —— 现在编出来的是**围栏台架测试固件**，
-不是生产固件。它不启动 GNSS / MQTT / 运动传感器，不进深睡，只开一个串口控制台。
+**三个分支编出来的东西不一样，先看清在哪个分支：**
 
-要回到生产固件：把 `FENCE_BENCH` 改回 `0`。
+| 分支 | 编出来的固件 |
+|---|---|
+| `p1-protocol`（当前开发） | **生产固件**，`FENCE_BENCH = 0`，按 `MQTT_PROTOCOL.md`（ct/v1）上报 |
+| `p0-bench` | P0 实验固件（`P0_BENCH = 1`），见那个分支里的 `P0_BENCH.md` |
+| `connect-fleet` | 围栏台架测试固件（`FENCE_BENCH = 1`），旧的 `fleet/<IMEI>/battery` 上报 |
 
 ### 1.1 交接（每次切会话只更新这一节）
 
-**上个会话停在哪**
+**上个会话停在哪**（2026-11-20）
 
-围栏高压块带机全部跑通：充电 411 V / 4.84 ms、单发约 2000 V 尖峰 / 10 µs、
-`f burst 10 1` 十发约 50 ms（要求 100 ms，2× 余量）。数据和余量见 `FENCE_BRINGUP.md`。
-之后只做了文档沉淀，没动固件逻辑。
+- 和云端工程师分工：固件归我们，broker（TLS + 每台独立凭据）和正式后端归他。
+  在他的 broker 就绪前，用 FleetManager（Y 盘，分支 `p1-protocol`）当测试平台。
+- 定了协议 `MQTT_PROTOCOL.md`（英文为准）/ `MQTT_PROTOCOL_zh.md`：topic `ct/v1/{id}/…`，
+  设备 ID = `CT-001` 这类编号。服务器只有刺激「总开关」，协议里没有任何触发放电的消息。
+- **P1 第一步（上行）已完成，云端编译通过，未上板**：编号写入、status + telemetry、心跳、
+  定位失败也上报、UTC 时间。FleetManager 加了 `/api/collar` 和 Cattle 标签页。
+- P0 实验固件在 `p0-bench` 分支，等台架测试（决定围栏判定放 GNSS 还是固件）。
+- 围栏高压块带机已全部跑通（411 V / 4.84 ms，十连发约 50 ms），见 `FENCE_BRINGUP.md`。
 
 **下一步（按建议顺序）**
 
-1. **定 `TRACK_CYCLE_SEC`** —— 现在是调试值 30 s，是续航的最大杠杆（见 `POWER_BUDGET.md` 4.2）。
-   30 s → 全静止 24 天；300 s → 170 天。定这个值之前谈别的省电都没意义。
-2. **心跳 N 未定** —— 现在 `do_gnss = MOTION || cold_boot`，牛一直不动就永远不上报，
-   平台侧分不清"没动"和"掉线"。`TRACK_DOUBT_MAX` 到 5 之后目前什么都不触发（见第 4 节缺口）。
-3. OTA 分区（2MB → 8MB，要有线全擦重烧一次）。
-4. 围栏边界测试：电池串 100 / 220 mΩ 跑 `f burst 10 1`，模拟老化/低温电芯 ESR。
+1. **上板验证 P1 第一步**：写编号 → 看 FleetManager Cattle 页出现心跳 / 动作 / 定位失败的上报。
+2. **P1 第二步（下行）**：订阅 `config` / `stim` / `all/stim`，校验后存 NVS，`status.applied` 回执；
+   FleetManager 加设置面板和 retained 发布。
+3. P0 台架测试 → 定围栏方案 → `fence` 下行格式（协议 v1.1）。
+4. OTA 分区（2MB → 8MB，要有线全擦重烧一次）。
+5. 围栏边界测试：电池串 100 / 220 mΩ 跑 `f burst 10 1`，模拟老化/低温电芯 ESR。
 
 **悬而未决**
 
-- 心跳周期 N：等业务侧给"最长允许多久没消息"。
-- `MOTION_MEAN_DELTA_TH_MG = 20` 是台面上手晃标定的，挂到真牛身上必然要重调。
+- 出货的心跳间隔 / 检查周期（开发值 10 min / 60 s，下行做好后可远程改）。
+- 加速度计中断唤醒（ext1）能否替代 60 s 轮询：等 P0 第 ① 项。
+- 动作门限 20 mg 是台面上手晃标定的，挂到真牛身上必然要重调。
 
 ---
 
@@ -73,18 +82,18 @@ USB-Serial-JTAG 为次级。深睡会断开 USB 枚举，所以调试深睡循�
 
 | 开关 | 行为 |
 |---|---|
-| `ENABLE_TRACKING_POLICY = 1`（**当前**） | 运动驱动：每 `TRACK_CYCLE_SEC` 醒一次，判定有动作才开 GNSS |
-| `ENABLE_TRACKING_POLICY = 0` | 退回旧的固定周期：每 `GPS_CYCLE_SLEEP_MIN` 分钟无条件定位上报 |
+| `ENABLE_TRACKING_POLICY = 1`（**必须**） | 运动驱动 + 心跳，见第 4 节 |
+| `ENABLE_TRACKING_POLICY = 0` | P1 起**编译报错**：旧的固定周期路径已删除 |
 
-注意 `GPS_CYCLE_SLEEP_MIN` **只在 `= 0` 的分支里生效**（`mqtt_module.c` 的 `#else`）。
-`= 1` 时改它没有任何效果，唯一还会用到它的地方是任务启动时那行日志——容易看错。
+`GPS_CYCLE_SLEEP_MIN`、`TRACK_CYCLE_SEC`、`TRACK_FIX_TIMEOUT_S` 在 P1 里**都不再生效**，
+节奏参数一律走 `ct_cfg()`（默认值是 `hardware_config.h` 末尾的 `CT_CFG_*`）。
 
 ---
 
 ## 4. 生产固件的主循环
 
-每 **30 秒**（`TRACK_CYCLE_SEC`）深睡唤醒一次。**深睡 = 复位**，RAM 全丢，
-只有 `RTC_DATA_ATTR` 存活。
+每 **`check_s`（默认 60 s）** 深睡唤醒一次。**深睡 = 复位**，RAM 全丢，
+只有 `RTC_DATA_ATTR` 存活。上电 / 复位那一次先开 10 秒串口窗口（`id CT-001` 写编号，`go` 跳过）。
 
 ```
 唤醒
@@ -92,8 +101,15 @@ USB-Serial-JTAG 为次级。深睡会断开 USB 枚举，所以调试深睡循�
  ├─ 读 LIS2DH12 的 INT1_SRC 锁存位   ← 必须在任何重配置之前读
  ├─ 锁存=0 → 判「确定静止」，跳过采样，直接睡
  └─ 锁存=1 → 5 秒运动采样（100Hz ODR / 20ms 取样）
-      ├─ 平均帧差 >= MOTION_MEAN_DELTA_TH_MG(20mg) → 「有动作」→ 开 GNSS 定位 + 上报
-      └─ 不够 → 「存疑」→ 不开 GNSS
+      ├─ 平均帧差 >= motion_th_mg(20mg) → 「有动作」
+      └─ 不够 → 「存疑」
+
+track_decide() 决定上报原因：
+  冷启动 → boot；有动作且距上次动作上报 >= motion_min_s(300) → motion；
+  否则距上次上报 >= heartbeat_min(10) → heartbeat；其余不联网直接睡
+要上报：按原因开 GNSS（motion/boot 90 s，heartbeat 30 s，0 = 不开）
+  → 不管定没定到都上报（gps=null + fix_fail）→ ct_report()：status(retained) + telemetry
+上报失败也重置计时（没信号时不每轮重试，免得耗光电池）
 ```
 
 判据是**相邻帧的加速度矢量差** `‖a[n] − a[n−1]‖` 的平均值，不是 `|‖a‖ − 1g|`。
@@ -102,13 +118,8 @@ USB-Serial-JTAG 为次级。深睡会断开 USB 枚举，所以调试深睡循�
 
 决策逻辑全在 `tracking_policy.c` 的 `track_decide()`，是个纯函数，好测。
 
-### 已知缺口
-
-`do_gnss = 有动作 || 冷启动`，**没有心跳**。长时间趴着不动的牛会完全静默，
-后台无法区分"牛没动"和"设备挂了"。`TRACK_DOUBT_MAX` 累计到 5 之后目前
-不触发任何动作（它加的 `streak` 只改 `mode`，而 `mode` 自从去掉高低频后不再影响设备行为 —— 它和 `streak`/`doubt` 只是被打进 MQTT payload 的 `track` 字段给后台看）。
-
-堵法：存疑累计 N 次强制定位一次（兼做心跳）。**N 待定。**
+`mode` / `streak` / `doubt` 还在 `tracking_policy.c` 里维护，但已不影响任何行为，也不再上报，
+只剩日志诊断用。
 
 ---
 
@@ -161,6 +172,8 @@ IO13(围栏 TRIG) 这种没有外部下拉的"动作"脚，等于主动置位。
 | `POWER_BUDGET.md` | 功耗预算、深睡电流排查过程、供电架构问题、续航估算 |
 | `固件调试操作手册.pdf` | **三种形态怎么切、每种下有哪些指令和操作**、现场判断速查 |
 | `睡眠与运动唤醒机制.pdf` | 睡眠/唤醒机制的图文说明（给人看的版本） |
+| `MQTT_PROTOCOL.md` | **设备与后端的协议契约**（ct/v1，英文为准，发给云端工程师的就是它） |
+| `MQTT_PROTOCOL_zh.md` | 上面的中文对照版，改协议时两份一起改 |
 | `PORTING_NOTES.md` | 从 pe_board 移植的记录。引脚映射表仍然准确，可当引脚速查用 |
 | `围栏调试与固件架构.html` | 本轮会话的图文回顾：带机过程 + 软件架构图（给人看，不是给新会话读的） |
 
@@ -182,7 +195,10 @@ IO13(围栏 TRIG) 这种没有外部下拉的"动作"脚，等于主动置位。
 | `tracking_policy.c` | 运动判定的纯决策函数 + RTC 状态 |
 | `motion_sensor.c` | LIS2DH12：睡眠布防、锁存读取、5 秒采样 |
 | `gnss_module.c` | LC760Z：NMEA 解析、Backup 进出 |
-| `mqtt_module.c` | EG800 AT 收发、注网、MQTT 发布（最大的文件） |
+| `mqtt_module.c` | EG800 AT 收发、注网、MQTT 发布（`mqtt_publish_ex` 支持 QoS1 + retain）、周期任务 |
+| `ct_proto.c` | ct/v1 协议：status / telemetry 的 JSON（cJSON）、UTC 校时、单调时钟、seq |
+| `ct_config.c` | 运行配置 `ct_cfg()`；第一步只有编译期默认值，第二步加下行 + NVS |
+| `device_id.c` | 设备编号（NVS）、上电计数、上电 10 秒串口窗口 |
 | `gpio_module.c` | 引脚初始化、围栏引脚安全态、电源控制 |
 | `fence_bench.c` | 围栏台架控制台（`FENCE_BENCH=1` 才编译） |
 | `eg915_selftest.c` | 产测自检（`SELFTEST=1` 走的就是它的 `Selftest_task`） |
@@ -204,15 +220,15 @@ IO13(围栏 TRIG) 这种没有外部下拉的"动作"脚，等于主动置位。
 
 **软件**（按建议顺序，详见 1.1 交接）
 
-1. **定 `TRACK_CYCLE_SEC`** —— 现在 30 s 是调试值，续航的最大杠杆
-2. **心跳机制**（见第 4 节缺口），N 待定
+1. **P1 第二步：下行 config / stim**（见 1.1）
+2. 用 ext1 中断替代 60 s 轮询（等 P0 结论）
 3. 蜂窝 OTA（EG800 走 `AT+QHTTP*`，需要二进制安全的 UART 路径 + 打开硬件流控）
 4. NimBLE GATT + NVS 配置层，之后是 Flutter App
 
-> 出货前的开关检查：`FENCE_BENCH` 回 `0`、`SELFTEST` 保持 `0`、`ENABLE_TRACKING_POLICY` 保持 `1`。
-> `GPS_CYCLE_SLEEP_MIN` 不用管 —— 它只在 `ENABLE_TRACKING_POLICY = 0` 时才生效。
+> 出货前的开关检查：`FENCE_BENCH = 0`、`SELFTEST = 0`、`P0_BENCH` 不存在或为 0。
+> 节奏参数改 `CT_CFG_*` 默认值，或下行做好后由服务器下发。
 
 **测试**
 
 - 围栏在老化/低温电池下的边界（串 100/220 mΩ）
-- `MOTION_MEAN_DELTA_TH_MG` 的现场标定（挂到真牛身上调）
+- 动作门限 `motion_th_mg` 的现场标定（挂到真牛身上调）

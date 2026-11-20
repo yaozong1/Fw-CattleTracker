@@ -18,6 +18,8 @@ volatile int   gnss_fix_q     = 0;       // GGA fix质量(0无fix,1GPS,2DGPS,4RT
 volatile int   gnss_dim       = 0;       // GSA 维度(1无,2=2D,3=3D)
 volatile int   gnss_sats      = 0;       // GGA 在用卫星数
 volatile float gnss_hdop      = 0.0f;    // GGA/GSA HDOP
+volatile float gnss_alt_m     = 0.0f;    // GGA 海拔（MSL，米）
+volatile bool  gnss_alt_valid = false;
 
 // 记录各句型是否已见及状态，用于综合摘要
 volatile bool gnss_seen_rmc = false;
@@ -792,6 +794,7 @@ void gnss_parse_and_log_rmc(const char* nmea)
     const char* lng_hemi = fields[6];
     const char* spd_kn   = fields[7];
     const char* crs_deg  = fields[8];
+    const char* date_s   = (count > 9) ? fields[9] : NULL;   // ddmmyy
 
     GNSS_PARSE_LOG("RMC: time=%s status=%s lat=%s%s lng=%s%s spd(kn)=%s crs=%s", 
              time_utc, status, lat, lat_hemi, lng, lng_hemi, spd_kn, crs_deg);
@@ -817,6 +820,8 @@ void gnss_parse_and_log_rmc(const char* nmea)
             gnss_last_location.crs_deg = crs;
             strncpy(gnss_last_location.time_utc, time_utc ? time_utc : "", sizeof(gnss_last_location.time_utc)-1);
             gnss_last_location.time_utc[sizeof(gnss_last_location.time_utc)-1] = '\0';
+            strncpy(gnss_last_location.date_utc, date_s ? date_s : "", sizeof(gnss_last_location.date_utc)-1);
+            gnss_last_location.date_utc[sizeof(gnss_last_location.date_utc)-1] = '\0';
             gnss_last_location.valid = true;
         }
     }
@@ -853,6 +858,11 @@ void gnss_parse_and_log_gga(const char* nmea)
     int   fixq = fields[6] ? atoi(fields[6]) : 0;
     int   sats = fields[7] ? atoi(fields[7]) : 0;
     float hdop = fields[8] ? (float)atof(fields[8]) : 0.0f;
+    /* 字段 9 = 海拔（MSL，米）。没定位时为空 */
+    if (count > 9 && fields[9] && fields[9][0] && fixq > 0) {
+        gnss_alt_m = (float)atof(fields[9]);
+        gnss_alt_valid = true;
+    }
 
     bool prev_fix = gnss_has_fix;
     gnss_fix_q = fixq;

@@ -50,6 +50,7 @@ int uart_read_response(char* buffer, int max_len, int timeout_ms);
 bool mqtt_init_network(void);
 bool mqtt_connect_broker(void);
 bool mqtt_publish_message(const char* topic, const char* message);
+bool mqtt_publish_ex(const char* topic, const char* message, int qos, bool retain);
 bool mqtt_disconnect_broker(void);
 void mqtt_poll_urc(void);
 

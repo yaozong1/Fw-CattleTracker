@@ -1,6 +1,6 @@
 # Cattle Tracker — MQTT Protocol v1
 
-Status: **DRAFT v1.0** — 2026-11-20. For review by firmware (Yaozong) and backend.
+Status: **DRAFT v1.0** — 2026-11-20 (rev. 2: `ts_src=rtc`, failed attempts reset timers). For review by firmware (Yaozong) and backend.
 Firmware branch: `p1-protocol`. Topic prefix: `ct/v1/`.
 
 This document is the contract between the collar firmware and any backend
@@ -110,7 +110,7 @@ acknowledgement of what the device is now running.
 | Field | Type | Meaning |
 |---|---|---|
 | `ts` | int | Unix seconds UTC of this report. `0` if no time source yet |
-| `ts_src` | string | `gnss` (from RMC date+time) · `net` (modem network time) · `none` |
+| `ts_src` | string | `gnss` (from RMC date+time this cycle) · `net` (modem network time this cycle) · `rtc` (device clock, set by an earlier `gnss`/`net` sync and kept running through deep sleep) · `none` (never synced since power-on) |
 | `boot` | int | Power-on counter (NVS). Increments on every cold boot / reset, not on deep-sleep wake |
 | `seq` | int | Message counter within this `boot`, starts at 1. Dedup key = (`id`, `boot`, `seq`) |
 | `reason` | string | `motion` · `heartbeat` · `boot` (first report after power-on) · `manual` (IO0 double-click) |
@@ -119,7 +119,7 @@ acknowledgement of what the device is now running.
 | `gps.alt` | number | metres above MSL (from GGA); omitted if unavailable |
 | `gps.spd_kmh` / `gps.hdg` | number | ground speed, course over ground (deg) |
 | `gps.hdop` / `gps.sats` | number / int | fix quality — backend should treat `hdop > 5` as unreliable |
-| `gps.ttff_s` | number | time from GNSS wake to fix this cycle |
+| `gps.ttff_s` | number | time from GNSS wake to fix this cycle; omitted for `manual` reports (position taken from the last fix, no wait) |
 | `fix_fail` | bool | present and `true` only when a fix was attempted and timed out |
 | `bat.mv` / `bat.soc` | int | battery voltage (mV) / estimated state of charge (%) |
 | `act.event` | string | motion classification this cycle: `motion` · `still` · `doubt` |
@@ -198,6 +198,12 @@ compatibility).
 
 Any report resets the heartbeat timer — a `motion` report counts as
 "not silent".
+
+A report **attempt that fails** (no coverage, broker unreachable) also resets
+the timers. The device does not retry every `check_s` — in a dead zone that
+would drain the battery — it tries again at the next heartbeat or motion
+report. Backend effect: a collar in a dead zone goes "offline" after
+`1.5 × heartbeat_min` and recovers on its own when coverage returns.
 
 ### 5.2 `stim` and `all/stim`
 

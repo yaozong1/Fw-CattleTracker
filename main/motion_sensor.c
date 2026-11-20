@@ -1,4 +1,5 @@
 #include "motion_sensor.h"
+#include "ct_config.h"
 #include "hardware_config.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
@@ -637,7 +638,7 @@ int motion_activity_mg(uint32_t window_ms, int *pct_out, int *peak_mg_out)
 
     ESP_LOGI(TAG, "运动采样：%lu ms / %d 点 -> 平均帧差 %d mg（门限 %d mg）"
                   "｜峰值 %.0f mg，>%u mg 占比 %d%%，沿计数 %d 次｜(对照 |‖a‖-1g| 峰值 %.0f mg)",
-             (unsigned long)window_ms, total, mean, MOTION_MEAN_DELTA_TH_MG,
+             (unsigned long)window_ms, total, mean, (int)ct_cfg()->motion_th_mg,
              (double)(peak_d * 1000.0f), (unsigned)MOTION_DELTA_TH_MG, pct, edges,
              (double)(peak_m * 1000.0f));
 

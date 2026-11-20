@@ -19,6 +19,7 @@
 #include "eg915_selftest.h"
 #include "tracking_policy.h"
 #include "fence_bench.h"
+#include "device_id.h"
 
 static const char *TAG = "APP";
 
@@ -38,6 +39,10 @@ void app_note_publish_ok(void)      { s_pub_ok_count++; }
 void app_main(void)
 {
     ESP_LOGI(TAG, "Cattle Tracker Application Starting...");
+
+    /* 设备编号 + 上电计数（NVS）。深睡唤醒不算一次上电 */
+    const bool cold_boot = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);
+    devid_init(cold_boot);
 
 #if FENCE_BENCH
     /* 围栏台架测试固件：只起 GPIO（含引脚安全态）+ 电池 ADC + 控制台。
@@ -122,6 +127,12 @@ void app_main(void)
     // 1. 初始化GPIO（含电子围栏引脚安全状态）
     gpio_init();
 
+    /* 1.0 只在上电 / 复位时：10 秒串口窗口，可写设备编号（id CT-001）。
+     * 放在 gpio_init() 之后，围栏引脚已经是安全态 */
+    if (cold_boot) {
+        devid_console_window(CT_PROVISION_WINDOW_MS);
+    }
+
     // 1.1 IO0 按键手势：双击打开围栏供电轨，长按关回安全状态
     button_module_start();
 
@@ -157,7 +168,7 @@ void app_main(void)
     xTaskCreate(gnss_task, "gnss_task", 6144, NULL, 8, NULL);
 
     // 8. 启动GPS+MQTT周期任务
-    xTaskCreate(gps_mqtt_cycle_task, "gps_cycle", 4096, NULL, 9, NULL);
+    xTaskCreate(gps_mqtt_cycle_task, "gps_cycle", 6144, NULL, 9, NULL);   /* cJSON + AT 缓冲，4096 偏紧 */
 
     // 等待系统稳定
     vTaskDelay(2000 / portTICK_PERIOD_MS);

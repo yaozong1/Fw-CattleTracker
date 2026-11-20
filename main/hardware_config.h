@@ -511,7 +511,7 @@
  * 生产固件里【绝对不要】保留"从串口给储能电容充电"这条路径。
  * ======================================================================== */
 #ifndef FENCE_BENCH
-#define FENCE_BENCH 1
+#define FENCE_BENCH 0
 #endif
 
 /* D25 (SS14) 焊了没有。
@@ -805,5 +805,38 @@
 #endif
 
 /* MQTT 主题统一在 mqtt_config.h 定义，避免宏重复定义 */
+
+/* ==================== P1：ct/v1 协议（MQTT_PROTOCOL.md） ====================
+ * 固件版本 / 硬件名出现在 status 里。
+ * CT_CFG_* 是运行配置的出厂默认值（开发阶段的值），服务器下发 config 后被覆盖。
+ * 业务代码通过 ct_cfg() 取值，不直接用这些宏。
+ * ========================================================================== */
+#ifndef CT_FW_VERSION
+#define CT_FW_VERSION "0.3.0-p1"
+#endif
+#ifndef CT_HW_NAME
+#define CT_HW_NAME "Cattle_T"
+#endif
+
+#ifndef CT_CFG_HEARTBEAT_MIN
+#define CT_CFG_HEARTBEAT_MIN 10       // 最长沉默 10 分钟（开发值；量产几小时）
+#endif
+#ifndef CT_CFG_MOTION_MIN_S
+#define CT_CFG_MOTION_MIN_S 300       // 持续走动时，最多 5 分钟报一次位置
+#endif
+#ifndef CT_CFG_CHECK_S
+#define CT_CFG_CHECK_S 60             // 轮询方式：每 60 s 醒来读一次加速度计锁存位
+#endif
+#ifndef CT_CFG_FIX_TIMEOUT_S
+#define CT_CFG_FIX_TIMEOUT_S 90       // motion / boot / manual 的定位超时
+#endif
+#ifndef CT_CFG_HB_FIX_TIMEOUT_S
+#define CT_CFG_HB_FIX_TIMEOUT_S 30    // heartbeat 的定位超时；0 = 心跳不开 GNSS
+#endif
+
+/* 上电 / 复位时开放的串口窗口（写设备编号用），深睡唤醒不开。0 = 关掉 */
+#ifndef CT_PROVISION_WINDOW_MS
+#define CT_PROVISION_WINDOW_MS 10000
+#endif
 
 #endif // HARDWARE_CONFIG_H

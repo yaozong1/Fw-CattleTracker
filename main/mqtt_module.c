@@ -6,6 +6,9 @@
 #include "battery_module.h"
 #include "motion_sensor.h"
 #include "tracking_policy.h"
+#include "device_id.h"
+#include "ct_proto.h"
+#include "ct_config.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -98,7 +101,8 @@ bool device_fetch_imei(void)
                     memcpy(s_device_id, start, 15);
                     s_device_id[15] = '\0';
                     s_device_id_valid = true;
-                    ESP_LOGI(TAG, "deviceId bound to IMEI: %s", s_device_id);
+                    devid_set_imei(s_device_id);
+                    ESP_LOGI(TAG, "IMEI: %s  -> 设备编号 %s", s_device_id, devid_get());
                     return true;
                 }
                 p += digits;
@@ -617,7 +621,7 @@ bool mqtt_connect_broker(void)
         ESP_LOGI(TAG, "Step 4: Connecting MQTT client...");
         char conn_cmd[256];
         snprintf(conn_cmd, sizeof(conn_cmd), "AT+QMTCONN=0,\"%s\",\"%s\",\"%s\"", 
-                 MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+                 devid_get(), MQTT_USERNAME, MQTT_PASSWORD);   /* Client ID = 设备编号 */
         send_at_command(conn_cmd);
         if (!wait_for_ok_then_contains("+QMTCONN: 0,0,0", 10000)) {
             ESP_LOGW(TAG, "Failed to connect MQTT client (attempt %d)", attempt);
@@ -666,6 +670,37 @@ bool mqtt_publish_message(const char* topic, const char* message)
     
     ESP_LOGI(TAG, "Message published successfully");
     step("发布消息");
+    return true;
+}
+
+/* QoS 0/1 + retain。ct/v1 用 QoS 1：模组收到 PUBACK 才回 +QMTPUBEX: 0,<msgid>,0
+ * （<result> 1 = 正在重传，2 = 失败）。QoS 0 时 msgid 必须为 0。 */
+bool mqtt_publish_ex(const char* topic, const char* message, int qos, bool retain)
+{
+    static uint16_t s_msgid = 0;
+    uint16_t id = 0;
+    if (qos > 0) {
+        s_msgid = (uint16_t)((s_msgid % 65535U) + 1U);
+        id = s_msgid;
+    }
+
+    char pub_cmd[160];
+    snprintf(pub_cmd, sizeof(pub_cmd), "AT+QMTPUBEX=0,%u,%d,%d,\"%s\",%d",
+             (unsigned)id, qos, retain ? 1 : 0, topic, (int)strlen(message));
+    send_at_command(pub_cmd);
+    if (!wait_for_contains(">", 3000)) {
+        ESP_LOGW(TAG, "QMTPUBEX 没给出 '>' 提示符（%s）", topic);
+        return false;
+    }
+    uart_write_bytes(UART_EG800_NUM, message, strlen(message));
+
+    char want[40];
+    snprintf(want, sizeof(want), "+QMTPUBEX: 0,%u,0", (unsigned)id);
+    if (!wait_for_contains(want, qos > 0 ? 15000 : 5000)) {
+        ESP_LOGW(TAG, "没等到 %s（%s）", want, topic);
+        return false;
+    }
+    step(retain ? "发布(retained)" : "发布");
     return true;
 }
 
@@ -1032,7 +1067,20 @@ static void manual_publish_task(void *pv)
         step("模组开机(已开,跳过)");
     }
 
-    bool ok = publish_battery_payload();
+    /* 手动上报不等定位：现在有有效定位就带上，没有就 gps=null（不带 fix_fail，因为没尝试） */
+    ct_report_t rp = {
+        .reason     = CT_REASON_MANUAL,
+        .gnss_tried = false,
+        .fix_ok     = gnss_rmc_valid && gnss_last_location.valid,
+        .ttff_s     = -1.0f,
+        .act_event  = NULL,
+        .act_mg     = -1,
+        .still_min  = -1,
+        .vbat       = s_vbat_idle,
+    };
+    if (rp.fix_ok) { ct_time_from_gnss(); }
+    bool ok = ct_report(&rp);
+    track_note_manual_report(ct_mono_s());
     ESP_LOGI("PUB", "Manual publish %s", ok ? "SUCCESS" : "FAILED");
     seq_report(ok ? "手动上报（成功）" : "手动上报（失败）");
 
@@ -1186,187 +1234,176 @@ static void enter_deep_sleep_cycle(uint32_t seconds)
 }
 #endif // ENABLE_DEEP_SLEEP
 
+#if !ENABLE_TRACKING_POLICY
+#error "P1（ct/v1）需要 ENABLE_TRACKING_POLICY=1：心跳和动作限频都在 tracking_policy 里"
+#endif
+
+static const char *act_event_str(track_event_t e)
+{
+    switch (e) {
+        case TRACK_EV_MOTION: return "motion";
+        case TRACK_EV_STILL:  return "still";
+        default:              return "doubt";
+    }
+}
+
+static ct_reason_t reason_of(track_report_t r)
+{
+    switch (r) {
+        case TRACK_RPT_BOOT:      return CT_REASON_BOOT;
+        case TRACK_RPT_MOTION:    return CT_REASON_MOTION;
+        case TRACK_RPT_HEARTBEAT: return CT_REASON_HEARTBEAT;
+        default:                  return CT_REASON_NONE;
+    }
+}
+
+static void cycle_sleep(uint32_t seconds)
+{
+#if ENABLE_DEEP_SLEEP
+    enter_deep_sleep_cycle(seconds);   /* 不返回：醒来是复位，从 app_main 重新开始 */
+#else
+    vTaskDelay(pdMS_TO_TICKS(seconds * 1000U));
+#endif
+}
+
+/* ================= 周期任务（MQTT_PROTOCOL.md） =================
+ * 每 check_s 醒一次：
+ *   1) 读加速度计锁存位（+ 必要时 5 秒采样）→ track_decide() 决定这一轮报不报、为什么报
+ *   2) 要报：按原因定定位超时（motion/boot 90 s，heartbeat 30 s，0 = 不开 GNSS）
+ *   3) 不管有没有定位都上报 —— 定位失败时 gps=null + fix_fail
+ *   4) GNSS 回 Backup，模组 QPOWD + 断轨，深睡
+ * ================================================================ */
 void gps_mqtt_cycle_task(void* pv)
 {
-    ESP_LOGI("GPS", "gps_mqtt_cycle_task started: sleep=%d min, fix timeout=%d s, mqtt retries=%d",
-             GPS_CYCLE_SLEEP_MIN, GPS_FIX_TIMEOUT_SEC, MQTT_SEND_MAX_RETRY);
-
-#if ENABLE_TRACKING_POLICY
-    ESP_LOGI("TRACK", "运动驱动已启用：每 %d s 醒一次读锁存，动作门限 平均帧差 %d mg/%d ms，"
-                      "只有判定为「有动作」才唤醒 GNSS（定位超时 %d s）",
-             TRACK_CYCLE_SEC, MOTION_MEAN_DELTA_TH_MG, MOTION_WINDOW_MS, TRACK_FIX_TIMEOUT_S);
-#endif
+    const ct_cfg_t *c = ct_cfg();
+    ESP_LOGI("TRACK", "ct/v1：设备 %s｜心跳 %u min｜动作上报间隔 >= %u s｜每 %u s 检查加速度计｜"
+                      "定位超时 动作 %u s / 心跳 %u s｜动作门限 %u mg",
+             devid_get(), c->heartbeat_min, c->motion_min_s, c->check_s,
+             c->fix_timeout_s, c->hb_fix_timeout_s, c->motion_th_mg);
 
     while (1) {
         bool powered_modem = false;
+        bool woke_gnss     = false;
 
-        /* ---- 1) 运动判定 ----
-         * 必须放在唤醒 GNSS 之前：GNSS 现在还在 Backup（µA 级），
-         * 判定为无动作就直接回去睡，连 RESET_N 唤醒那 770 ms 都省掉。 */
-#if ENABLE_TRACKING_POLICY
-        track_input_t  ti = { .latched = true, .activity_mg = -1 };
+        /* ---- 1) 运动判定 + 上报决策 ----
+         * 放在唤醒 GNSS 之前：不上报的轮次 GNSS 一直在 Backup，RESET_N 都不用打。 */
+        track_input_t ti = { .latched = true, .activity_mg = -1, .now_s = ct_mono_s() };
         ti.latched = motion_read_and_clear_latch();
         if (ti.latched) {
             ti.activity_mg = motion_activity_mg(MOTION_WINDOW_MS, NULL, NULL);
         } else {
             ESP_LOGI("TRACK", "睡眠窗口全程静止，跳过 %d ms 采样", MOTION_WINDOW_MS);
         }
-
         track_output_t td = track_decide(ti);
-        uint32_t fix_timeout_s = td.fix_timeout_sec;
-        uint32_t next_sleep_s  = td.sleep_sec;
+        uint32_t next_sleep_s = td.sleep_sec;
 
-        /* streak 只作诊断：连续静止了几轮（×30s 就是静止多久）。
-         * 原来显示成 streak=9/3 里的分母是 TRACK_NO_MOTION_STREAK，
-         * 那是「连续几轮静止就切 LOW 频率」的门槛 —— 取消双档后它已经不起作用，
-         * 带着分母只会让人误以为越过 3 就该停，所以去掉。
-         * doubt 的分母还留着，TRACK_DOUBT_MAX 是真的在用。 */
-        ESP_LOGW("TRACK", "第 %lu 轮｜锁存=%d 活动=%d mg -> %s%s｜已静止 %u 轮 doubt=%u/%d｜%s，下轮睡 %lus",
+        ESP_LOGW("TRACK", "第 %lu 轮｜锁存=%d 活动=%d mg -> %s%s｜%s｜下轮睡 %lus",
                  (unsigned long)track_cycles(), (int)ti.latched, ti.activity_mg,
                  track_event_str(td.event), td.cold_boot ? "(冷启动)" : "",
-                 td.streak, td.doubt, TRACK_DOUBT_MAX,
-                 td.do_gnss ? "开 GNSS 定位" : "不开 GNSS",
+                 td.report == TRACK_RPT_NONE ? "不上报" : track_report_str(td.report),
                  (unsigned long)next_sleep_s);
 
-        if (!td.do_gnss) {
-            ESP_LOGI("GPS", "===== 无动作，跳过定位与上报，deep sleep %lu 秒 =====",
-                     (unsigned long)next_sleep_s);
-
-            /* 必须确保 GNSS 回到 Backup 再睡。
-             * 理论上它上一轮睡前就进 Backup 了、这一轮也没人唤醒它，
-             * 但开机时 gnss_init() 会重新配置 IO2(RESET_N) 和 UART2，
-             * 引脚方向切换的瞬间有可能给出一个复位脉冲把它叫醒 ——
-             * 一旦醒了又没人放回去，整个睡眠窗口就是满功率搜星（约 40 mA）。
-             * 已经在 Backup 时这条命令不会有副作用，报告里的
-             * 「发送前输出速率」会直接告诉我们它当时是醒是睡。 */
+        if (td.report == TRACK_RPT_NONE) {
+            /* gnss_init() 切 IO2 方向时可能给出复位脉冲把它叫醒，醒着没人管就是 40 mA 整个窗口 */
             gnss_ensure_standby_fast();
-
             modem_power_enable(false);
-#if ENABLE_DEEP_SLEEP
-            enter_deep_sleep_cycle(next_sleep_s);   /* 不返回 */
-#else
-            vTaskDelay(next_sleep_s * 1000 / portTICK_PERIOD_MS);
-#endif
+            cycle_sleep(next_sleep_s);
             continue;
         }
-#else
-        uint32_t fix_timeout_s = (uint32_t)GPS_FIX_TIMEOUT_SEC;
-        uint32_t next_sleep_s  = (uint32_t)GPS_CYCLE_SLEEP_MIN * 60U;
-#endif
 
-        /* ---- 2) 有动作才走到这里：唤醒 GNSS ----
-         * 从 deep sleep 醒来时模组还在 Backup，只能用 RESET_N 脉冲叫醒。 */
-        gnss_enable(true);
-        gnss_reset_release();
+        ct_report_t rp = {
+            .reason     = reason_of(td.report),
+            .gnss_tried = false,
+            .fix_ok     = false,
+            .ttff_s     = -1.0f,
+            .act_event  = act_event_str(td.event),
+            .act_mg     = ti.activity_mg,
+            .still_min  = td.still_min,
+            .vbat       = 0.0f,
+        };
 
-        /* 无论是深睡唤醒还是上电/复位，都无法知道 GNSS 当前是不是在 Backup：
-         * RAM 里的状态标志深睡会丢；而按复位或烧录时模组的电压根本没断，
-         * 它会一直保持在上一轮进的 Backup 里 —— 不发这个脉冲就永远没有 NMEA。
-         * 对已经在跑的模组，这个脉冲只是让它重启一次（约 770 ms），无害。
-         * 以前靠 gpio_init() 里 IO11 的毛刺「顺带」把它撞醒，那是 bug 不是设计。 */
-        ESP_LOGI("GPS", "确保 GNSS 脱离 Backup（RESET_N 脉冲）");
-        gnss_wake_from_standby2();
+        /* ---- 2) 定位 ---- */
+        if (td.do_gnss) {
+            /* 深睡醒来模组还在 Backup，只能 RESET_N 唤醒；对已在跑的模组只是重启一次，无害 */
+            gnss_enable(true);
+            gnss_reset_release();
+            gnss_wake_from_standby2();
+            woke_gnss = true;
 
-        // 3) 等待 GNSS 定位
-        gnss_last_location.valid = false;
-        gnss_reset_state_for_ttff();
-        ESP_LOGI("GPS", "Waiting GNSS fix (timeout %lus)...", (unsigned long)fix_timeout_s);
-        TickType_t t0 = xTaskGetTickCount();
-        while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(fix_timeout_s * 1000)) {
-            if (gnss_last_location.valid) { break; }
-            vTaskDelay(200 / portTICK_PERIOD_MS);
-        }
-
-        // 2.1) 定位成功：在串口打一段完整的定位信息
-        if (gnss_last_location.valid) {
-            uint32_t ttff_ms = (uint32_t)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS);
-            ESP_LOGI("GPS", "================ GNSS FIX ACQUIRED ================");
-            ESP_LOGI("GPS", "  UTC       : %s", gnss_last_location.time_utc);
-            ESP_LOGI("GPS", "  Latitude  : %.6f deg", gnss_last_location.lat_deg);
-            ESP_LOGI("GPS", "  Longitude : %.6f deg", gnss_last_location.lon_deg);
-            ESP_LOGI("GPS", "  Speed     : %.2f kn (%.1f km/h)",
-                     gnss_last_location.spd_kn, gnss_last_location.spd_kn * 1.852);
-            ESP_LOGI("GPS", "  Course    : %.1f deg", gnss_last_location.crs_deg);
-            ESP_LOGI("GPS", "  Satellites: %d, HDOP %.1f, fixQ %d, dim %dD",
-                     gnss_sats, gnss_hdop, gnss_fix_q, gnss_dim);
-            ESP_LOGI("GPS", "  Time to fix: %lu ms", (unsigned long)ttff_ms);
-            ESP_LOGI("GPS", "===================================================");
-#if ENABLE_DEEP_SLEEP
-            app_note_fix_ok();
-#endif
-        }
-
-        // 3) 若拿到定位，则唤醒 EG800 并进行 MQTT
-#if ENABLE_MQTT
-        if (gnss_last_location.valid) {
-            // 独占模组总线，手动上报任务此时会主动让路
-            modem_bus_lock(portMAX_DELAY);
-
-            // 模组还没上电，此刻是空载，先把电池电压记下来
-            battery_snapshot_idle();
-
-            // 上报前闪一下 CONN_LED，指示"准备上云"
-            led_blink(LED_CONN_PIN, GPS_UPLOAD_BLINK_TIMES,
-                      GPS_UPLOAD_BLINK_ON_MS, GPS_UPLOAD_BLINK_OFF_MS);
-
-            ESP_LOGI("GPS", "GNSS fix acquired, bringing up EG800 for MQTT publish");
-            /* 与双击手动上报走同一套判断：深睡醒来时 3.8V 轨一定是关的，
-             * 但 ENABLE_DEEP_SLEEP=0 的连续运行模式下可能已经开着，别重复打 PWRKEY。 */
-            seq_begin();
-            if (!modem_is_powered()) {
-                ESP_LOGI("MODEM", "Wake EG800: PWRKEY pulse to publish");
-                modem_power_cycle();
-                step("模组开机");
-            } else {
-                ESP_LOGI("MODEM", "模组已在运行（STATUS=1），跳过开机");
-                step("模组开机(已开,跳过)");
+            gnss_last_location.valid = false;
+            gnss_reset_state_for_ttff();
+            ESP_LOGI("GPS", "等定位（%s，超时 %lu s）...", track_report_str(td.report),
+                     (unsigned long)td.fix_timeout_sec);
+            TickType_t t0 = xTaskGetTickCount();
+            while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(td.fix_timeout_sec * 1000U)) {
+                if (gnss_last_location.valid) { break; }
+                vTaskDelay(pdMS_TO_TICKS(200));
             }
-            powered_modem = true;
+            rp.gnss_tried = true;
 
-            bool pub_ok = publish_battery_payload();
-            ESP_LOGI("BAT", "Publish %s", pub_ok ? "success" : "failed");
-            track_note_publish(pub_ok);
-            seq_report(pub_ok ? "周期上报（成功）" : "周期上报（失败）");
+            if (gnss_last_location.valid) {
+                rp.fix_ok = true;
+                rp.ttff_s = (float)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS) / 1000.0f;
+                ESP_LOGI("GPS", "定位：%.6f, %.6f  卫星 %d  HDOP %.1f  用时 %.1f s",
+                         gnss_last_location.lat_deg, gnss_last_location.lon_deg,
+                         gnss_sats, gnss_hdop, rp.ttff_s);
+                if (!ct_time_from_gnss()) {
+                    ESP_LOGW("GPS", "RMC 没有日期，本轮不用 GNSS 校时");
+                }
 #if ENABLE_DEEP_SLEEP
-            if (pub_ok) { app_note_publish_ok(); }
+                app_note_fix_ok();
 #endif
-            // 注意：锁要持有到第 4 步关掉模组之后再放
+            } else {
+                ESP_LOGW("GPS", "%lu s 内没有定位 —— 照样上报（gps=null, fix_fail）",
+                         (unsigned long)td.fix_timeout_sec);
+            }
         } else {
-            ESP_LOGW("GPS", "No GNSS fix within %lus, skip EG800/MQTT and go to sleep", (unsigned long)fix_timeout_s);
+            ESP_LOGI("GPS", "心跳配置为不开 GNSS（hb_fix_timeout_s=0）");
         }
-#endif
 
-        /* 4) 进入省电（方案 E）
-         *    GNSS -> Backup（VCC 保持，星历留存，热启动）
-         *    模组 -> QPOWD 正常关机 + 断 3.8V 轨
-         *    ESP32 -> deep sleep                                      */
-        ESP_LOGI("GPS", "===== 进入省电：GNSS Backup + 模组关机 + ESP deep sleep %lu 秒（mode=%s）=====",
-                 (unsigned long)next_sleep_s,
-#if ENABLE_TRACKING_POLICY
-                 track_mode_str(td.mode));
-#else
-                 "fixed");
-#endif
+        /* ---- 3) 上报：不管有没有定位 ---- */
+#if ENABLE_MQTT
+        modem_bus_lock(portMAX_DELAY);          /* 独占模组，手动上报会让路 */
+        battery_snapshot_idle();                /* 模组上电前的空载电压 */
+        rp.vbat = s_vbat_idle;
 
-        gnss_enter_standby2();
+        led_blink(LED_CONN_PIN, GPS_UPLOAD_BLINK_TIMES,
+                  GPS_UPLOAD_BLINK_ON_MS, GPS_UPLOAD_BLINK_OFF_MS);
 
-        if (powered_modem) {
-            modem_power_down_full();
-            modem_bus_unlock();   // 与第 3 步的 lock 配对，关完模组才放锁
+        seq_begin();
+        if (!modem_is_powered()) {
+            modem_power_cycle();
+            step("模组开机");
         } else {
-            ESP_LOGI("MODEM", "本轮没开过模组，只确保 3.8V 轨是关的");
+            step("模组开机(已开,跳过)");
+        }
+        powered_modem = true;
+
+        bool pub_ok = ct_report(&rp);
+        track_note_publish(pub_ok);
+        seq_report(pub_ok ? "上报（成功）" : "上报（失败）");
+#if ENABLE_DEEP_SLEEP
+        if (pub_ok) { app_note_publish_ok(); }
+#endif
+#endif
+        /* 失败也记一次：没信号时每 check_s 重试会把电池耗光，等下一个心跳 / 动作再试 */
+        track_note_report(td.report, ti.now_s);
+
+        /* ---- 4) 省电：GNSS Backup + 模组关机断轨 + 深睡 ---- */
+        if (woke_gnss) {
+            gnss_enter_standby2();
+        } else {
+            gnss_ensure_standby_fast();
+        }
+        if (powered_modem) {
+#if ENABLE_MQTT
+            modem_power_down_full();
+            modem_bus_unlock();                 /* 和第 3 步的 lock 配对 */
+#endif
+        } else {
             modem_power_enable(false);
         }
-
-#if ENABLE_DEEP_SLEEP
-        enter_deep_sleep_cycle(next_sleep_s);
-        // enter_deep_sleep_cycle() 不返回，醒来是复位、从 app_main 重新开始
-#else
-        // 不用 deep sleep 时退回原来的行为：任务级延时 + 唤醒 GNSS
-        vTaskDelay(next_sleep_s * 1000 / portTICK_PERIOD_MS);
-        ESP_LOGI("GNSS_LP", "Wake GNSS from backup");
-        gnss_wake_from_standby2();
-#endif
+        cycle_sleep(next_sleep_s);
     }
 }
 
