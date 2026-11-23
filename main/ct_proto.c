@@ -35,6 +35,9 @@ RTC_DATA_ATTR static uint8_t  s_synced;         /* 系统时间校准过 */
 RTC_DATA_ATTR static uint8_t  s_last_src;       /* 最近一次校时的来源 */
 RTC_DATA_ATTR static uint32_t s_last_sync_mono; /* 最近一次校时的单调时刻 */
 
+#define CT_TIME_MIN_YEAR 2024
+#define CT_TIME_MAX_YEAR 2040
+
 /* 本条上报的时间来源判定窗口：最近这么久之内校过时，算作"本轮"来源 */
 #define CT_SYNC_FRESH_S 180
 
@@ -63,7 +66,15 @@ static void clock_set(time_t t, ts_src_t src)
 static time_t utc_from_fields(int y, int mo, int d, int h, int mi, int s)
 {
     tz_utc_once();
-    if (y < 2024 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 ||
+    /* 年份只信 2024–2040：EG800 没收到 NITZ 时 AT+QLTS 会返回自己时钟的默认值
+     * （实测 2070-01-01 起算），GNSS 没定到位时 RMC 也可能带默认日期。
+     * 这些都必须拒绝，否则错误时钟会被 settimeofday 写进 RTC，深睡也一直带着。 */
+    if (y < CT_TIME_MIN_YEAR || y > CT_TIME_MAX_YEAR) {
+        ESP_LOGW(TAG, "拒绝不可信的时间 %04d-%02d-%02d %02d:%02d:%02d（年份不在 %d–%d）",
+                 y, mo, d, h, mi, s, CT_TIME_MIN_YEAR, CT_TIME_MAX_YEAR);
+        return 0;
+    }
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 ||
         h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 60) {
         return 0;
     }
