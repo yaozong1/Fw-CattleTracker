@@ -27,19 +27,22 @@ ESP32-S3 牛羊项圈：GNSS 定位 + LTE 上报 + 电子围栏高压块。
   在他的 broker 就绪前，用 FleetManager（Y 盘，分支 `p1-protocol`）当测试平台。
 - 定了协议 `MQTT_PROTOCOL.md`（英文为准）/ `MQTT_PROTOCOL_zh.md`：topic `ct/v1/{id}/…`，
   设备 ID = `CT-001` 这类编号。服务器只有刺激「总开关」，协议里没有任何触发放电的消息。
-- **P1 第一步（上行）已完成，云端编译通过，未上板**：编号写入、status + telemetry、心跳、
-  定位失败也上报、UTC 时间。FleetManager 加了 `/api/collar` 和 Cattle 标签页。
+- **P1 第一步（上行）**：编号写入、status + telemetry、心跳、定位失败也上报、UTC 时间。
+  FleetManager 加了 `/api/collar` 和 Cattle 标签页，已在本地跑通（用 MQTTX 发的假数据）。
+- **P1 第二步（下行）**：连网后订阅 `config` / `stim` / `all/stim`，整条校验后存 NVS，
+  `status.applied` / `status.err` 回执。FleetManager 加了 `/api/collar/control`（仅 admin）、
+  设置面板、单台刺激开关（打开要确认）、全群总闸、审计日志 `collar:audit`。
+- **两步都只在云端编译通过 + 主机单元测试（串口解析、校验逻辑），还没上板。**
 - P0 实验固件在 `p0-bench` 分支，等台架测试（决定围栏判定放 GNSS 还是固件）。
 - 围栏高压块带机已全部跑通（411 V / 4.84 ms，十连发约 50 ms），见 `FENCE_BRINGUP.md`。
 
 **下一步（按建议顺序）**
 
-1. **上板验证 P1 第一步**：写编号 → 看 FleetManager Cattle 页出现心跳 / 动作 / 定位失败的上报。
-2. **P1 第二步（下行）**：订阅 `config` / `stim` / `all/stim`，校验后存 NVS，`status.applied` 回执；
-   FleetManager 加设置面板和 retained 发布。
-3. P0 台架测试 → 定围栏方案 → `fence` 下行格式（协议 v1.1）。
-4. OTA 分区（2MB → 8MB，要有线全擦重烧一次）。
-5. 围栏边界测试：电池串 100 / 220 mΩ 跑 `f burst 10 1`，模拟老化/低温电芯 ESR。
+1. **上板验证 P1**：写编号 → Cattle 页出现心跳 / 动作 / 定位失败；网页改配置 / 开关
+   → 下次连网后显示 applied。重点看日志里 `recv/mode`、`+QMTSUB`、`+QMTRECV` 三处（未在 EG800 上验证过）。
+2. P0 台架测试 → 定围栏方案 → `fence` 下行格式（协议 v1.1）。
+3. OTA 分区（2MB → 8MB，要有线全擦重烧一次）。
+4. 围栏边界测试：电池串 100 / 220 mΩ 跑 `f burst 10 1`，模拟老化/低温电芯 ESR。
 
 **悬而未决**
 
@@ -195,9 +198,9 @@ IO13(围栏 TRIG) 这种没有外部下拉的"动作"脚，等于主动置位。
 | `tracking_policy.c` | 运动判定的纯决策函数 + RTC 状态 |
 | `motion_sensor.c` | LIS2DH12：睡眠布防、锁存读取、5 秒采样 |
 | `gnss_module.c` | LC760Z：NMEA 解析、Backup 进出 |
-| `mqtt_module.c` | EG800 AT 收发、注网、MQTT 发布（`mqtt_publish_ex` 支持 QoS1 + retain）、周期任务 |
+| `mqtt_module.c` | EG800 AT 收发、注网、MQTT 发布（`mqtt_publish_ex` QoS1 + retain）、订阅收下行（`mqtt_subscribe_collect`）、周期任务 |
 | `ct_proto.c` | ct/v1 协议：status / telemetry 的 JSON（cJSON）、UTC 校时、单调时钟、seq |
-| `ct_config.c` | 运行配置 `ct_cfg()`；第一步只有编译期默认值，第二步加下行 + NVS |
+| `ct_config.c` | 运行配置 `ct_cfg()` + 下行校验应用（config / stim / all/stim，存 NVS key `dl`）。**只管许可，不调用任何放电函数** |
 | `device_id.c` | 设备编号（NVS）、上电计数、上电 10 秒串口窗口 |
 | `gpio_module.c` | 引脚初始化、围栏引脚安全态、电源控制 |
 | `fence_bench.c` | 围栏台架控制台（`FENCE_BENCH=1` 才编译） |
@@ -220,7 +223,7 @@ IO13(围栏 TRIG) 这种没有外部下拉的"动作"脚，等于主动置位。
 
 **软件**（按建议顺序，详见 1.1 交接）
 
-1. **P1 第二步：下行 config / stim**（见 1.1）
+1. 上板验证 P1（见 1.1）
 2. 用 ext1 中断替代 60 s 轮询（等 P0 结论）
 3. 蜂窝 OTA（EG800 走 `AT+QHTTP*`，需要二进制安全的 UART 路径 + 打开硬件流控）
 4. NimBLE GATT + NVS 配置层，之后是 Flutter App

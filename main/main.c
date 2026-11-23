@@ -20,6 +20,7 @@
 #include "tracking_policy.h"
 #include "fence_bench.h"
 #include "device_id.h"
+#include "ct_config.h"
 
 static const char *TAG = "APP";
 
@@ -43,6 +44,7 @@ void app_main(void)
     /* 设备编号 + 上电计数（NVS）。深睡唤醒不算一次上电 */
     const bool cold_boot = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED);
     devid_init(cold_boot);
+    ct_cfg_load();      /* 已生效的下行（config / stim / all/stim），依赖上面的 NVS 初始化 */
 
 #if FENCE_BENCH
     /* 围栏台架测试固件：只起 GPIO（含引脚安全态）+ 电池 ADC + 控制台。

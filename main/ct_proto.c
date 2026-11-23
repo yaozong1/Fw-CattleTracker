@@ -224,9 +224,9 @@ static char *build_status(const char *iccid)
 
     cJSON *a = cJSON_AddObjectToObject(o, "applied");
     cJSON_AddNumberToObject(a, "cfg_ver", c->ver);
-    cJSON_AddNumberToObject(a, "stim_ver", 0);        /* 第二步接下行后填真实值 */
-    cJSON_AddNumberToObject(a, "all_stim_ver", 0);
-    cJSON_AddNumberToObject(a, "fence_ver", 0);
+    cJSON_AddNumberToObject(a, "stim_ver", ct_stim_ver());
+    cJSON_AddNumberToObject(a, "all_stim_ver", ct_all_stim_ver());
+    cJSON_AddNumberToObject(a, "fence_ver", 0);        /* 围栏下行在协议 v1.1 定义 */
 
     cJSON *g = cJSON_AddObjectToObject(o, "cfg");
     cJSON_AddNumberToObject(g, "heartbeat_min", c->heartbeat_min);
@@ -236,7 +236,15 @@ static char *build_status(const char *iccid)
     cJSON_AddNumberToObject(g, "hb_fix_timeout_s", c->hb_fix_timeout_s);
     cJSON_AddNumberToObject(g, "motion_th_mg", c->motion_th_mg);
 
-    cJSON_AddNullToObject(o, "err");
+    const ct_dl_err_t *e = ct_last_err();
+    if (e) {
+        cJSON *er = cJSON_AddObjectToObject(o, "err");
+        cJSON_AddStringToObject(er, "topic", e->topic);
+        cJSON_AddNumberToObject(er, "ver", e->ver);
+        cJSON_AddStringToObject(er, "reason", e->reason);
+    } else {
+        cJSON_AddNullToObject(o, "err");
+    }
 
     char *s = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -287,7 +295,8 @@ static char *build_telemetry(const ct_report_t *r, int rssi_dbm, uint32_t seq)
         cJSON_AddNumberToObject(n, "rssi", rssi_dbm);
     }
 
-    cJSON_AddFalseToObject(o, "stim");     /* 第二步接下行后填真实值；v1.0 没有围栏逻辑 */
+    /* 实际生效的许可 = 本机开关 AND 全群总闸。v1.0 没有围栏逻辑，许可不会引发任何动作 */
+    cJSON_AddBoolToObject(o, "stim", ct_stim_effective());
 
     char *s = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -299,6 +308,19 @@ static char *build_telemetry(const ct_report_t *r, int rssi_dbm, uint32_t seq)
 static void topic_of(char *out, size_t sz, const char *leaf)
 {
     snprintf(out, sz, "%s/%s/%s", CT_TOPIC_ROOT, devid_get(), leaf);
+}
+
+#define CT_TOPIC_ALL_STIM CT_TOPIC_ROOT "/all/stim"
+
+static char s_t_cfg[64], s_t_stim[64];
+
+/* +QMTRECV 回调：按 topic 分发到 ct_config */
+static void on_downlink(const char *topic, const char *payload, int len)
+{
+    if (strcmp(topic, s_t_cfg) == 0)                 ct_downlink_apply(CT_DL_CONFIG, payload, len);
+    else if (strcmp(topic, s_t_stim) == 0)           ct_downlink_apply(CT_DL_STIM, payload, len);
+    else if (strcmp(topic, CT_TOPIC_ALL_STIM) == 0)  ct_downlink_apply(CT_DL_ALL_STIM, payload, len);
+    else ESP_LOGW(TAG, "不认识的下行 topic：%s", topic);
 }
 
 bool ct_report(const ct_report_t *r)
@@ -321,6 +343,15 @@ bool ct_report(const ct_report_t *r)
         modem_get_iccid(iccid, sizeof(iccid));
 
         if (!mqtt_connect_broker()) continue;        /* Client ID = devid_get() */
+
+        /* 下行：订阅 → 收 retained → 校验应用（协议 §3.1）。必须在 status 之前，
+         * status.applied 才是"现在在用什么"的回执。订阅失败不影响上报。 */
+        topic_of(s_t_cfg, sizeof(s_t_cfg), "config");
+        topic_of(s_t_stim, sizeof(s_t_stim), "stim");
+        const char *subs[] = { s_t_cfg, s_t_stim, CT_TOPIC_ALL_STIM };
+        if (!mqtt_subscribe_collect(subs, 3, CT_DOWNLINK_WAIT_MS, on_downlink)) {
+            ESP_LOGW(TAG, "订阅下行失败，本轮只上报");
+        }
 
         bool ok = false;
         char *st = build_status(iccid);

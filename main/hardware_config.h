@@ -834,6 +834,11 @@
 #define CT_CFG_HB_FIX_TIMEOUT_S 30    // heartbeat 的定位超时；0 = 心跳不开 GNSS
 #endif
 
+/* SUBACK 之后等 retained 下行的时间（协议 §6） */
+#ifndef CT_DOWNLINK_WAIT_MS
+#define CT_DOWNLINK_WAIT_MS 3000
+#endif
+
 /* 上电 / 复位时开放的串口窗口（写设备编号用），深睡唤醒不开。0 = 关掉 */
 #ifndef CT_PROVISION_WINDOW_MS
 #define CT_PROVISION_WINDOW_MS 10000

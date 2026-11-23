@@ -607,6 +607,14 @@ bool mqtt_connect_broker(void)
             goto connect_fail_delay;
         }
         
+        /* 2b. 下行接收模式：直接以 URC 吐出，并带上 payload 长度
+         *     +QMTRECV: 0,<msgid>,"<topic>",<len>,"<payload>"
+         *     有长度才能正确截取多行 / 含引号的 JSON。模组不认就退回无长度格式，不算失败。 */
+        send_at_command("AT+QMTCFG=\"recv/mode\",0,0,1");
+        if (!wait_for_ok(2000)) {
+            ESP_LOGW(TAG, "模组不支持 recv/mode 带长度，下行按无长度格式解析");
+        }
+
         // 3. 打开MQTT网络连接
         ESP_LOGI(TAG, "Step 3: Opening MQTT network connection...");
         char open_cmd[256];
@@ -702,6 +710,121 @@ bool mqtt_publish_ex(const char* topic, const char* message, int qos, bool retai
     }
     step(retain ? "发布(retained)" : "发布");
     return true;
+}
+
+/* ================= 下行：订阅 + 收 retained =================
+ * 一条 AT+QMTSUB 订阅所有 topic，broker 回 SUBACK 后立刻把 retained 消息推过来。
+ * 在 window_ms 内把模组吐出的东西全收进缓冲，再统一解析 +QMTRECV。
+ * 消息很小（每条几百字节），一次全收完比边收边解析简单可靠。 */
+
+#define SUBCOLLECT_BUF   4096
+#define SUBACK_TIMEOUT_MS 10000
+
+/* 解析缓冲里所有 +QMTRECV，逐条回调。兼容有长度 / 无长度两种格式 */
+static int parse_qmtrecv(char *buf, int len, mqtt_recv_cb_t cb)
+{
+    int n = 0;
+    char *p = buf, *end = buf + len;
+    while (p < end && (p = strstr(p, "+QMTRECV: ")) != NULL) {
+        char *q = p + 10;
+        /* <client_idx>,<msgid>, */
+        char *c1 = strchr(q, ',');
+        char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+        if (!c2 || c2[1] != '"') { p = q; continue; }
+        char *topic = c2 + 2;
+        char *tq = strchr(topic, '"');
+        if (!tq || tq[1] != ',') { p = q; continue; }
+        *tq = '\0';
+        char *r = tq + 2;
+        char *payload = NULL;
+        int plen = -1;
+
+        if (*r >= '0' && *r <= '9') {
+            /* 有长度：<len>,"<payload>" */
+            plen = (int)strtol(r, &r, 10);
+            if (r[0] == ',' && r[1] == '"' && r + 2 + plen <= end) {
+                payload = r + 2;
+                p = payload + plen;
+            }
+        } else if (*r == '"') {
+            /* 无长度：payload 到 "\r\n 为止 */
+            payload = r + 1;
+            char *e = strstr(payload, "\"\r\n");
+            if (e) { plen = (int)(e - payload); p = e + 3; }
+            else   { payload = NULL; }
+        }
+        if (!payload || plen < 0) {
+            ESP_LOGW(TAG, "+QMTRECV 不完整（topic=%s），丢弃", topic);
+            p = tq + 1;
+            continue;
+        }
+        char saved = payload[plen];
+        payload[plen] = '\0';
+        ESP_LOGI(TAG, "下行 %s (%d B)", topic, plen);
+        cb(topic, payload, plen);
+        payload[plen] = saved;
+        n++;
+    }
+    return n;
+}
+
+bool mqtt_subscribe_collect(const char *const topics[], int n_topics,
+                            uint32_t window_ms, mqtt_recv_cb_t cb)
+{
+    static uint16_t s_sub_id = 0;
+    static char     buf[SUBCOLLECT_BUF];   /* 静态：周期任务栈放不下 4 KB */
+
+    s_sub_id = (uint16_t)((s_sub_id % 65535U) + 1U);
+    char cmd[256];
+    int k = snprintf(cmd, sizeof(cmd), "AT+QMTSUB=0,%u", (unsigned)s_sub_id);
+    for (int i = 0; i < n_topics && k < (int)sizeof(cmd); ++i) {
+        k += snprintf(cmd + k, sizeof(cmd) - k, ",\"%s\",1", topics[i]);
+    }
+    char want[32];
+    snprintf(want, sizeof(want), "+QMTSUB: 0,%u,0", (unsigned)s_sub_id);
+
+    uart_flush_input(UART_EG800_NUM);
+    send_at_command(cmd);
+
+    int len = 0;
+    bool suback = false;
+    TickType_t t0 = xTaskGetTickCount(), t_ack = 0;
+    buf[0] = '\0';
+
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+        if (!suback && (now - t0) > pdMS_TO_TICKS(SUBACK_TIMEOUT_MS)) break;
+        if (suback && (now - t_ack) > pdMS_TO_TICKS(window_ms)) break;
+
+        size_t avail = 0;
+        uart_get_buffered_data_len(UART_EG800_NUM, &avail);
+        if (avail > 0 && len < SUBCOLLECT_BUF - 1) {
+            int want_n = (int)avail;
+            if (want_n > SUBCOLLECT_BUF - 1 - len) want_n = SUBCOLLECT_BUF - 1 - len;
+            int r = uart_read_bytes(UART_EG800_NUM, (uint8_t *)buf + len, want_n, 0);
+            if (r > 0) { len += r; buf[len] = '\0'; }
+            if (!suback && strstr(buf, want)) {
+                suback = true;
+                t_ack = xTaskGetTickCount();
+            }
+            if (!suback && strstr(buf, "ERROR")) break;
+        } else {
+            if (len >= SUBCOLLECT_BUF - 1) {
+                ESP_LOGW(TAG, "下行缓冲满（%d B），后面的丢弃", SUBCOLLECT_BUF);
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    if (!suback) {
+        ESP_LOGW(TAG, "订阅没有收到 SUBACK（%s）", strstr(buf, "ERROR") ? "ERROR" : "超时");
+    }
+    int n = parse_qmtrecv(buf, len, cb);
+    ESP_LOGI(TAG, "订阅 %d 个 topic，%s，收到 %d 条下行", n_topics,
+             suback ? "SUBACK OK" : "SUBACK 失败", n);
+    step("订阅+收下行");
+    return suback;
 }
 
 void mqtt_poll_urc(void)

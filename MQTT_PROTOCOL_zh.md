@@ -137,7 +137,7 @@ DISCONNECT
 | `reset` | 本次启动的 ESP32 复位原因：`poweron` · `deepsleep` · `sw` · `panic` · `wdt` · `brownout` · `other` |
 | `applied.*_ver` | 各类下行当前生效的版本号；`0` = 从没收到过（使用固件默认值） |
 | `cfg` | **实际生效**的配置（已补全默认值、通过校验） |
-| `err` | `null`，或最近一次被拒收的下行，例如 `{ "topic": "config", "ver": 4, "reason": "heartbeat_min out of range" }` |
+| `err` | `null`，或最近一次被拒收的下行，例如 `{ "topic": "config", "ver": 4, "reason": "heartbeat_min must be an integer 5-1440" }`。`topic` 取值为 `config` · `stim` · `all/stim`。同一 topic 之后有消息被成功应用时清除 |
 
 因为是 retained，即使设备在睡觉，`status` 也始终保存着它最近一次的身份、固件版本和已生效的版本号。
 

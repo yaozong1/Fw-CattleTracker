@@ -51,6 +51,13 @@ bool mqtt_init_network(void);
 bool mqtt_connect_broker(void);
 bool mqtt_publish_message(const char* topic, const char* message);
 bool mqtt_publish_ex(const char* topic, const char* message, int qos, bool retain);
+
+/* 下行：一次订阅多个 topic（QoS1），SUBACK 后在 window_ms 内收集 retained 消息，
+ * 对每条 +QMTRECV 回调 cb(topic, payload, len)。payload 以 '\0' 结尾，回调返回后失效。
+ * 返回是否收到 SUBACK。 */
+typedef void (*mqtt_recv_cb_t)(const char *topic, const char *payload, int len);
+bool mqtt_subscribe_collect(const char *const topics[], int n_topics,
+                            uint32_t window_ms, mqtt_recv_cb_t cb);
 bool mqtt_disconnect_broker(void);
 void mqtt_poll_urc(void);
 

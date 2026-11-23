@@ -148,7 +148,7 @@ acknowledgement of what the device is now running.
 | `reset` | ESP32 reset reason of this boot: `poweron` · `deepsleep` · `sw` · `panic` · `wdt` · `brownout` · `other` |
 | `applied.*_ver` | version of each downlink currently in effect; `0` = never received (using firmware defaults) |
 | `cfg` | the **effective** configuration (after defaults and validation) |
-| `err` | `null`, or `{ "topic": "config", "ver": 4, "reason": "heartbeat_min out of range" }` for the last rejected downlink |
+| `err` | `null`, or `{ "topic": "config", "ver": 4, "reason": "heartbeat_min must be an integer 5-1440" }` for the last rejected downlink. `topic` is `config` · `stim` · `all/stim`. Cleared when a later message on the same topic is applied |
 
 Because it is retained, `status` always holds the device's latest known
 identity, firmware and applied versions — even while it sleeps.
