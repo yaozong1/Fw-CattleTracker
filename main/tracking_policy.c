@@ -163,7 +163,17 @@ track_sleep_t track_sleep_plan(bool latched, uint32_t now_s)
     track_sleep_t p = { .sleep_s = c->check_s, .arm_ext1 = false, .hb_left_s = left };
 #if CT_WAKE_EXT1
     if (latched) {
-        p.sleep_s  = (left < c->check_s) ? left : c->check_s;   /* B 冷却 */
+        /* B 冷却：睡到「下次允许运动上报」为止（至少 check_s，不超过距心跳）。
+         * 报完运动后 motion_min_s 内醒来也不会再报，加速度计的锁存位会把这段时间
+         * 动没动过记下来，没必要每 check_s 醒一次。 */
+        uint32_t cool = c->check_s;
+        if (s_have_motion_rpt) {
+            uint32_t ms = now_s - s_last_motion_rpt_s;
+            if (ms < c->motion_min_s && (c->motion_min_s - ms) > cool) {
+                cool = c->motion_min_s - ms;
+            }
+        }
+        p.sleep_s  = (left < cool) ? left : cool;
         p.arm_ext1 = false;
     } else {
         p.sleep_s  = left;                                      /* A 长睡 */

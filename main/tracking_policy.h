@@ -71,7 +71,8 @@ const char *track_report_str(track_report_t r);
 /* 进深睡前调用（上报做完之后，now_s 用那一刻的 ct_mono_s()）：决定这一觉怎么睡。
  * latched = 本轮醒来读到的锁存位（ti.latched）。
  *   CT_WAKE_EXT1=1：latched=0 → A 长睡（ext1 开，定时到下次心跳）
- *                   latched=1 → B 冷却（ext1 关，定时 min(check_s, 距心跳)）
+ *                   latched=1 → B 冷却（ext1 关，定时到下次允许运动上报，
+ *                               至少 check_s、不超过距心跳）
  *   CT_WAKE_EXT1=0：每 check_s 定时醒（轮询），不开 ext1
  * 只做计算，不碰硬件；ext1 能不能真的开（布防失败、引脚已是高）由调用方再判断。 */
 typedef struct {
