@@ -473,7 +473,7 @@ bool motion_arm_for_sleep(void)
      *    结果静止时 ZH 一直置位。改成自动跟踪就不依赖这个时序了。 */
     if (!lis2dh12_write_register(LIS2DH12_CTRL_REG2, 0x80 | 0x01)) return false;
 
-    /* 4) CTRL_REG3 bit6 = I1_IA1：输出到 INT1 引脚（IO17），只作冗余 */
+    /* 4) CTRL_REG3 bit6 = I1_IA1：输出到 INT1 引脚（IO17）—— CT_WAKE_EXT1=1 时是深睡唤醒源 */
     if (!lis2dh12_write_register(LIS2DH12_CTRL_REG3, 0x40)) return false;
 
     /* 5) CTRL_REG4 = ±2g，低功耗模式下 HR 位必须为 0 */

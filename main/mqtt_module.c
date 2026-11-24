@@ -1305,10 +1305,9 @@ void mqtt_manual_publish_request(void)
 /* 进入 deep sleep。不返回：醒来等同于复位，从 app_main 重新跑一遍。
  * 跨睡眠不保留任何 RAM 状态——IMEI 每轮重读一次（模组本来就要重启），
  * APN 同理，成本可以忽略。 */
-static void enter_deep_sleep_cycle(uint32_t seconds)
+static void enter_deep_sleep_cycle(uint32_t seconds, bool arm_ext1)
 {
-    ESP_LOGI("SLEEP", "ESP32 deep sleep %lu 秒，醒来后从 app_main 重新开始",
-             (unsigned long)seconds);
+    bool acc_armed = false;
 
     /* 加速度计挂在 3V3_ALWAYS_ON 上，MCU 睡了它不会跟着睡。
      * 必须显式写 power-down，否则高分辨率 100 Hz 会一直吃 ~185 µA
@@ -1319,6 +1318,8 @@ static void enter_deep_sleep_cycle(uint32_t seconds)
     if (!motion_arm_for_sleep()) {
         ESP_LOGW("SLEEP", "加速度计布防失败，退回 power-down（本轮锁存位不可用）");
         motion_sensor_power_down();
+    } else {
+        acc_armed = true;
     }
 #else
     motion_sensor_power_down();
@@ -1327,7 +1328,40 @@ static void enter_deep_sleep_cycle(uint32_t seconds)
     // 锁住 RTC GPIO 的电平（GNSS 供电必须保持，围栏引脚必须保持低）
     deep_sleep_prepare_pins();
 
+#if CT_WAKE_EXT1
+    /* ext1：IO17 ← LIS2DH12 INT1，锁存、高有效、推挽（加速度计在常开轨上，睡眠期一直驱动）。
+     * 开不了的两种情况都退回「冷却睡」（定时 check_s、不开 ext1），醒来照样读锁存位：
+     *   - 加速度计没布防成功：INT1 不会动，开了也白开
+     *   - IO17 已经是高：布防到现在这零点几秒里又动了，开了会立刻醒 */
+    if (arm_ext1) {
+        const uint32_t cool = ct_cfg()->check_s;
+        gpio_set_direction(MOTION_SENSOR_INT1_PIN, GPIO_MODE_INPUT);
+        gpio_pullup_dis(MOTION_SENSOR_INT1_PIN);
+        gpio_pulldown_dis(MOTION_SENSOR_INT1_PIN);
+        int lv = gpio_get_level(MOTION_SENSOR_INT1_PIN);
+        if (!acc_armed || lv) {
+            ESP_LOGW("SLEEP", "%s，这一觉不开 ext1，改成冷却睡 %lu s",
+                     !acc_armed ? "加速度计没布防" : "IO17 已经是高（刚又动了）",
+                     (unsigned long)cool);
+            arm_ext1 = false;
+            if (seconds > cool) seconds = cool;
+        }
+    }
+    if (arm_ext1) {
+        ESP_ERROR_CHECK(esp_sleep_enable_ext1_wakeup(1ULL << MOTION_SENSOR_INT1_PIN,
+                                                     ESP_EXT1_WAKEUP_ANY_HIGH));
+    }
+    /* RTC_PERIPH 交给 IDF 自动决定（ext1 + 定时器下会断电）。P0 实测 ext1 不额外耗电。 */
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_AUTO);
+#else
+    (void)acc_armed;
+    arm_ext1 = false;
+#endif
+
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+    ESP_LOGI("SLEEP", "deep sleep：%s，定时 %lu s%s（醒来从 app_main 重新开始）",
+             arm_ext1 ? "A 长睡" : (CT_WAKE_EXT1 ? "B 冷却" : "轮询"),
+             (unsigned long)seconds, arm_ext1 ? " + IO17 加速度计中断" : "");
 
 #if DEEPSLEEP_WAKE_ON_BUTTON
     /* IO0 低电平唤醒。
@@ -1380,17 +1414,24 @@ static ct_reason_t reason_of(track_report_t r)
     }
 }
 
-static void cycle_sleep(uint32_t seconds)
+/* latched = 本轮醒来读到的锁存位。睡多久、开不开 ext1 见 track_sleep_plan()。
+ * 在上报做完之后才算：上报可能花掉一两分钟，要按那一刻算离心跳还有多久。 */
+static void cycle_sleep(bool latched)
 {
+    track_sleep_t sp = track_sleep_plan(latched, ct_mono_s());
+    ESP_LOGI("TRACK", "睡眠计划：锁存=%d -> %s %lu s（距心跳 %lu s）",
+             (int)latched,
+             sp.arm_ext1 ? "A 长睡(ext1)" : (CT_WAKE_EXT1 ? "B 冷却" : "轮询"),
+             (unsigned long)sp.sleep_s, (unsigned long)sp.hb_left_s);
 #if ENABLE_DEEP_SLEEP
-    enter_deep_sleep_cycle(seconds);   /* 不返回：醒来是复位，从 app_main 重新开始 */
+    enter_deep_sleep_cycle(sp.sleep_s, sp.arm_ext1);   /* 不返回：醒来是复位，从 app_main 重新开始 */
 #else
-    vTaskDelay(pdMS_TO_TICKS(seconds * 1000U));
+    vTaskDelay(pdMS_TO_TICKS(sp.sleep_s * 1000U));
 #endif
 }
 
 /* ================= 周期任务（MQTT_PROTOCOL.md） =================
- * 每 check_s 醒一次：
+ * 每次醒来（ext1 被晃醒 / 冷却到期 / 心跳到期；轮询方式下每 check_s）：
  *   1) 读加速度计锁存位（+ 必要时 5 秒采样）→ track_decide() 决定这一轮报不报、为什么报
  *   2) 要报：按原因定定位超时（motion/boot 90 s，heartbeat 30 s，0 = 不开 GNSS）
  *   3) 不管有没有定位都上报 —— 定位失败时 gps=null + fix_fail
@@ -1399,9 +1440,10 @@ static void cycle_sleep(uint32_t seconds)
 void gps_mqtt_cycle_task(void* pv)
 {
     const ct_cfg_t *c = ct_cfg();
-    ESP_LOGI("TRACK", "ct/v1：设备 %s｜心跳 %u min｜动作上报间隔 >= %u s｜每 %u s 检查加速度计｜"
+    ESP_LOGI("TRACK", "ct/v1：设备 %s｜心跳 %u min｜动作上报间隔 >= %u s｜%s %u s｜"
                       "定位超时 动作 %u s / 心跳 %u s｜动作门限 %u mg",
-             devid_get(), c->heartbeat_min, c->motion_min_s, c->check_s,
+             devid_get(), c->heartbeat_min, c->motion_min_s,
+             CT_WAKE_EXT1 ? "ext1 唤醒，冷却" : "轮询间隔", c->check_s,
              c->fix_timeout_s, c->hb_fix_timeout_s, c->motion_th_mg);
 
     while (1) {
@@ -1418,19 +1460,17 @@ void gps_mqtt_cycle_task(void* pv)
             ESP_LOGI("TRACK", "睡眠窗口全程静止，跳过 %d ms 采样", MOTION_WINDOW_MS);
         }
         track_output_t td = track_decide(ti);
-        uint32_t next_sleep_s = td.sleep_sec;
 
-        ESP_LOGW("TRACK", "第 %lu 轮｜锁存=%d 活动=%d mg -> %s%s｜%s｜下轮睡 %lus",
+        ESP_LOGW("TRACK", "第 %lu 轮｜锁存=%d 活动=%d mg -> %s%s｜%s",
                  (unsigned long)track_cycles(), (int)ti.latched, ti.activity_mg,
                  track_event_str(td.event), td.cold_boot ? "(冷启动)" : "",
-                 td.report == TRACK_RPT_NONE ? "不上报" : track_report_str(td.report),
-                 (unsigned long)next_sleep_s);
+                 td.report == TRACK_RPT_NONE ? "不上报" : track_report_str(td.report));
 
         if (td.report == TRACK_RPT_NONE) {
             /* gnss_init() 切 IO2 方向时可能给出复位脉冲把它叫醒，醒着没人管就是 40 mA 整个窗口 */
             gnss_ensure_standby_fast();
             modem_power_enable(false);
-            cycle_sleep(next_sleep_s);
+            cycle_sleep(ti.latched);
             continue;
         }
 
@@ -1526,7 +1566,7 @@ void gps_mqtt_cycle_task(void* pv)
         } else {
             modem_power_enable(false);
         }
-        cycle_sleep(next_sleep_s);
+        cycle_sleep(ti.latched);
     }
 }
 

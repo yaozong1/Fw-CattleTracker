@@ -812,8 +812,20 @@
  * 业务代码通过 ct_cfg() 取值，不直接用这些宏。
  * ========================================================================== */
 #ifndef CT_FW_VERSION
-#define CT_FW_VERSION "0.3.0-p1"
+#define CT_FW_VERSION "0.4.0-p1"
 #endif
+
+/* ---- 深睡唤醒方式 ----
+ * 1 = ext1：IO17 ← LIS2DH12 INT1（锁存，高有效）。两种睡法：
+ *       A 长睡：ext1 开 + 定时到下次心跳。牛不动时只有心跳会醒。
+ *       B 冷却：ext1 关 + 定时 check_s。被晃醒过、或这一觉醒来锁存位=1 时用；
+ *               醒来看锁存位：=1 继续 B，=0 回 A。
+ *     P0 ① 实测（p0-bench，2026-11-24）：定时 162 µA / ext1 163 µA，晃动能叫醒。
+ * 0 = 轮询：每 check_s 定时醒一次读锁存位（P1 原来的做法），留着做对比 / 回退。 */
+#ifndef CT_WAKE_EXT1
+#define CT_WAKE_EXT1 1
+#endif
+
 #ifndef CT_HW_NAME
 #define CT_HW_NAME "Cattle_T"
 #endif
@@ -825,7 +837,7 @@
 #define CT_CFG_MOTION_MIN_S 300       // 持续走动时，最多 5 分钟报一次位置
 #endif
 #ifndef CT_CFG_CHECK_S
-#define CT_CFG_CHECK_S 60             // 轮询方式：每 60 s 醒来读一次加速度计锁存位
+#define CT_CFG_CHECK_S 60             // ext1：两次中断唤醒之间至少隔多久（冷却）；轮询：每多久醒来读一次锁存位
 #endif
 #ifndef CT_CFG_FIX_TIMEOUT_S
 #define CT_CFG_FIX_TIMEOUT_S 90       // motion / boot / manual 的定位超时

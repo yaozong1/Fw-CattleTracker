@@ -188,7 +188,7 @@ Device behaviour, for every downlink topic:
 |---|---|---|---|
 | `heartbeat_min` | 10 | 5 – 1440 | Maximum silence. If nothing was reported for this long, report anyway |
 | `motion_min_s` | 300 | 60 – 3600 | Minimum interval between two `motion` reports while the animal keeps moving |
-| `check_s` | 60 | 10 – 600 | How often to wake and check the accelerometer. **Polling mode only** — ignored when the firmware runs interrupt wake (ext1) |
+| `check_s` | 60 | 10 – 600 | Interrupt wake (ext1, default): minimum gap between two accelerometer wakes — after a wake the collar ignores the interrupt for this long and re-checks on a timer. A still animal only wakes for heartbeats; a moving one at most every `check_s`. Polling build: how often to wake and check |
 | `fix_timeout_s` | 90 | 30 – 300 | GNSS fix timeout for `motion` / `boot` / `manual` reports |
 | `hb_fix_timeout_s` | 30 | 0 – 120 | GNSS fix timeout for `heartbeat` reports. `0` = heartbeat without GNSS |
 | `motion_th_mg` | 20 | 5 – 200 | Motion threshold (mean frame-to-frame delta) |

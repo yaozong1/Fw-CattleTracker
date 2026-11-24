@@ -96,7 +96,8 @@ bool motion_sensor_power_down(void);
  * 深睡期间 LIS2DH12 以 10 Hz 低功耗模式运行（datasheet Table 12: 3 µA），
  * 中断锁存（CTRL_REG5.LIR_INT1）。ESP32 醒来先读 INT1_SRC 拿到一个 bit：
  * "整个睡眠窗口内动过没有"。动过才值得再花 5 秒采样数次数。
- * 用不到 INT1 引脚（IO17）—— 锁存位在寄存器里，I2C 读就行。 */
+ * 锁存位在寄存器里，I2C 读就行；同一个锁存也拉高 INT1 引脚（IO17），
+ * CT_WAKE_EXT1=1 时用它做深睡唤醒源（ext1），读 INT1_SRC 后引脚回低。 */
 
 /* 进深睡前调用：切到 10 Hz 低功耗 + 高通滤波 + INT1 阈值中断 + 锁存，
  * 并清掉配置过程中产生的旧锁存，让下一个睡眠窗口从干净状态开始。

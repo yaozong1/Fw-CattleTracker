@@ -92,6 +92,9 @@ void app_main(void)
             case ESP_SLEEP_WAKEUP_TIMER:
                 ESP_LOGI(TAG, " 唤醒原因：deep sleep 定时器到期（正常上报轮次）");
                 break;
+            case ESP_SLEEP_WAKEUP_EXT1:
+                ESP_LOGI(TAG, " 唤醒原因：IO%d 加速度计中断（ext1，牛动了）", MOTION_SENSOR_INT1_PIN);
+                break;
             case ESP_SLEEP_WAKEUP_EXT0:
                 ESP_LOGI(TAG, " 唤醒原因：IO%d 按键（手动触发）", BUTTON_PIN);
                 break;

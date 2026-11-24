@@ -153,6 +153,28 @@ void track_note_manual_report(uint32_t now_s)
     s_last_report_s = now_s;
 }
 
+track_sleep_t track_sleep_plan(bool latched, uint32_t now_s)
+{
+    const ct_cfg_t *c = ct_cfg();
+    uint32_t hb    = (uint32_t)c->heartbeat_min * 60U;
+    uint32_t since = s_have_report ? (now_s - s_last_report_s) : hb;
+    uint32_t left  = (since >= hb) ? 1U : (hb - since);   /* 已到期：睡 1 s 马上补心跳 */
+
+    track_sleep_t p = { .sleep_s = c->check_s, .arm_ext1 = false, .hb_left_s = left };
+#if CT_WAKE_EXT1
+    if (latched) {
+        p.sleep_s  = (left < c->check_s) ? left : c->check_s;   /* B 冷却 */
+        p.arm_ext1 = false;
+    } else {
+        p.sleep_s  = left;                                      /* A 长睡 */
+        p.arm_ext1 = true;
+    }
+#else
+    (void)latched;
+#endif
+    return p;
+}
+
 const char *track_report_str(track_report_t r)
 {
     switch (r) {
