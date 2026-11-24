@@ -1440,10 +1440,10 @@ static void cycle_sleep(bool latched)
 void gps_mqtt_cycle_task(void* pv)
 {
     const ct_cfg_t *c = ct_cfg();
-    ESP_LOGI("TRACK", "ct/v1：设备 %s｜心跳 %u min｜动作上报间隔 >= %u s｜%s %u s｜"
-                      "定位超时 动作 %u s / 心跳 %u s｜动作门限 %u mg",
+    ESP_LOGI("TRACK", "ct/v1：设备 %s｜心跳间隔 %u min｜走动时每 %u s 报一次｜%s %u s｜"
+                      "定位等待 走动 %u s / 心跳 %u s｜在动门限 %u mg",
              devid_get(), c->heartbeat_min, c->motion_min_s,
-             CT_WAKE_EXT1 ? "ext1 唤醒，冷却" : "轮询间隔", c->check_s,
+             CT_WAKE_EXT1 ? "晃一下后再看" : "轮询间隔", c->check_s,
              c->fix_timeout_s, c->hb_fix_timeout_s, c->motion_th_mg);
 
     while (1) {

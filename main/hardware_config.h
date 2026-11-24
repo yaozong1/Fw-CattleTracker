@@ -832,19 +832,19 @@
 #endif
 
 #ifndef CT_CFG_HEARTBEAT_MIN
-#define CT_CFG_HEARTBEAT_MIN 10       // 最长沉默 10 分钟（开发值；量产几小时）
+#define CT_CFG_HEARTBEAT_MIN 10       // 心跳间隔：不动时每 10 分钟报一次（开发值；量产几小时）
 #endif
 #ifndef CT_CFG_MOTION_MIN_S
-#define CT_CFG_MOTION_MIN_S 300       // 持续走动时，最多 5 分钟报一次位置
+#define CT_CFG_MOTION_MIN_S 300       // 走动时的上报间隔：一直在动时每 5 分钟报一次；报完睡到下次能报
 #endif
 #ifndef CT_CFG_CHECK_S
-#define CT_CFG_CHECK_S 60             // ext1：两次中断唤醒之间至少隔多久（冷却）；轮询：每多久醒来读一次锁存位
+#define CT_CFG_CHECK_S 60             // 晃一下后多久再看：被叫醒但不算在动时 60 s 后再看；也是最短睡眠。轮询版：检查间隔
 #endif
 #ifndef CT_CFG_FIX_TIMEOUT_S
-#define CT_CFG_FIX_TIMEOUT_S 90       // motion / boot / manual 的定位超时
+#define CT_CFG_FIX_TIMEOUT_S 90       // 定位等待（走动 / 开机 / 手动）：最多等这么久，没定到也照样报
 #endif
 #ifndef CT_CFG_HB_FIX_TIMEOUT_S
-#define CT_CFG_HB_FIX_TIMEOUT_S 30    // heartbeat 的定位超时；0 = 心跳不开 GNSS
+#define CT_CFG_HB_FIX_TIMEOUT_S 30    // 定位等待（心跳）；0 = 心跳不开 GNSS
 #endif
 
 /* SUBACK 之后等 retained 下行的时间（协议 §6） */

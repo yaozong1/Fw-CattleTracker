@@ -186,12 +186,15 @@ Device behaviour, for every downlink topic:
 
 | Field | Default | Range | Meaning |
 |---|---|---|---|
-| `heartbeat_min` | 10 | 5 – 1440 | Maximum silence. If nothing was reported for this long, report anyway |
-| `motion_min_s` | 300 | 60 – 3600 | Minimum interval between two `motion` reports while the animal keeps moving |
-| `check_s` | 60 | 10 – 600 | Interrupt wake (ext1, default): minimum gap between two accelerometer wakes — after a wake the collar ignores the interrupt and re-checks on a timer, for `check_s` or until the next motion report is allowed (`motion_min_s` after the last one), whichever is longer. A still animal only wakes for heartbeats; a moving one about once per `motion_min_s`. Polling build: how often to wake and check |
-| `fix_timeout_s` | 90 | 30 – 300 | GNSS fix timeout for `motion` / `boot` / `manual` reports |
-| `hb_fix_timeout_s` | 30 | 0 – 120 | GNSS fix timeout for `heartbeat` reports. `0` = heartbeat without GNSS |
-| `motion_th_mg` | 20 | 5 – 200 | Motion threshold (mean frame-to-frame delta) |
+| `heartbeat_min` | 10 | 5 – 1440 | **Heartbeat interval.** A still animal reports this often (any report restarts the count). The backend marks a collar offline after 1.5 × this with no telemetry |
+| `motion_min_s` | 300 | 60 – 3600 | **Report interval while moving.** A moving animal gets one `motion` report this often; after a `motion` report the collar sleeps until the next one is due |
+| `check_s` | 60 | 10 – 600 | **Re-check after a small jolt.** Woken by the accelerometer but not really moving (no report): look again after this long. Also the shortest sleep, so keep it ≤ `motion_min_s` (if larger, it wins). Polling build: how often to wake and check |
+| `fix_timeout_s` | 90 | 30 – 300 | **GPS wait — moving / boot / manual.** Longest wait for a fix; reports anyway (`fix_fail`) if none |
+| `hb_fix_timeout_s` | 30 | 0 – 120 | **GPS wait — heartbeat.** Same for heartbeats. `0` = heartbeat without GNSS |
+| `motion_th_mg` | 20 | 5 – 200 | **Moving threshold.** Mean frame-to-frame acceleration delta over the 5 s sample; at or above this = moving. (Waking up needs a 96 mg jolt first — fixed in firmware) |
+
+Sleep in one line: still → until the next heartbeat; moving → one report every `motion_min_s`;
+a jolt that isn't real movement → look again after `check_s`. Never longer than the next heartbeat.
 
 Omitted fields take their default. Unknown fields are ignored (forward
 compatibility).
