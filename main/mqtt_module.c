@@ -1305,7 +1305,7 @@ void mqtt_manual_publish_request(void)
 /* 进入 deep sleep。不返回：醒来等同于复位，从 app_main 重新跑一遍。
  * 跨睡眠不保留任何 RAM 状态——IMEI 每轮重读一次（模组本来就要重启），
  * APN 同理，成本可以忽略。 */
-static void enter_deep_sleep_cycle(uint32_t seconds, bool arm_ext1)
+static void enter_deep_sleep_cycle(uint32_t seconds, bool arm_ext1, uint32_t hb_left_s)
 {
     bool acc_armed = false;
 
@@ -1359,6 +1359,9 @@ static void enter_deep_sleep_cycle(uint32_t seconds, bool arm_ext1)
 #endif
 
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+    /* 记下这一觉的睡法，醒来好分清是「心跳定时器」还是「冷却定时器」 */
+    track_note_sleep(arm_ext1 ? TRACK_SLEEP_A : (CT_WAKE_EXT1 ? TRACK_SLEEP_B : TRACK_SLEEP_POLL),
+                     seconds, seconds >= hb_left_s);
     ESP_LOGI("SLEEP", "deep sleep：%s，定时 %lu s%s（醒来从 app_main 重新开始）",
              arm_ext1 ? "A 长睡" : (CT_WAKE_EXT1 ? "B 冷却" : "轮询"),
              (unsigned long)seconds, arm_ext1 ? " + IO17 加速度计中断" : "");
@@ -1424,7 +1427,7 @@ static void cycle_sleep(bool latched)
              sp.arm_ext1 ? "A 长睡(ext1)" : (CT_WAKE_EXT1 ? "B 冷却" : "轮询"),
              (unsigned long)sp.sleep_s, (unsigned long)sp.hb_left_s);
 #if ENABLE_DEEP_SLEEP
-    enter_deep_sleep_cycle(sp.sleep_s, sp.arm_ext1);   /* 不返回：醒来是复位，从 app_main 重新开始 */
+    enter_deep_sleep_cycle(sp.sleep_s, sp.arm_ext1, sp.hb_left_s);   /* 不返回：醒来是复位，从 app_main 重新开始 */
 #else
     vTaskDelay(pdMS_TO_TICKS(sp.sleep_s * 1000U));
 #endif

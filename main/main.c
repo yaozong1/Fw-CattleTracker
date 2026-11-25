@@ -89,11 +89,31 @@ void app_main(void)
         ESP_LOGI(TAG, " 第 %lu 次启动（RTC 计数器，deep sleep 不清零）",
                  (unsigned long)s_boot_count);
         switch (wc) {
-            case ESP_SLEEP_WAKEUP_TIMER:
-                ESP_LOGI(TAG, " 唤醒原因：deep sleep 定时器到期（正常上报轮次）");
+            case ESP_SLEEP_WAKEUP_TIMER: {
+                uint32_t ps = 0;
+                bool hb = false;
+                switch (track_last_sleep(&ps, &hb)) {
+                    case TRACK_SLEEP_A:
+                        ESP_LOGI(TAG, " 唤醒原因：【心跳定时器】长睡 A 睡满 %lu s，期间没被晃醒 → 报心跳",
+                                 (unsigned long)ps);
+                        break;
+                    case TRACK_SLEEP_B:
+                        ESP_LOGI(TAG, " 唤醒原因：【冷却定时器】冷却 B 的 %lu s 到了 → 看这段时间有没有再动%s",
+                                 (unsigned long)ps, hb ? "；心跳也到期了" : "");
+                        break;
+                    case TRACK_SLEEP_POLL:
+                        ESP_LOGI(TAG, " 唤醒原因：【轮询定时器】每 %lu s 醒来看一次锁存%s",
+                                 (unsigned long)ps, hb ? "；心跳也到期了" : "");
+                        break;
+                    default:
+                        ESP_LOGI(TAG, " 唤醒原因：deep sleep 定时器到期（没有上一觉的记录）");
+                        break;
+                }
                 break;
+            }
             case ESP_SLEEP_WAKEUP_EXT1:
-                ESP_LOGI(TAG, " 唤醒原因：IO%d 加速度计中断（ext1，牛动了）", MOTION_SENSOR_INT1_PIN);
+                ESP_LOGI(TAG, " 唤醒原因：【加速度计中断】长睡 A 中被晃醒（IO%d，超过 96 mg）→ 采样 5 s 看是否真在动",
+                         MOTION_SENSOR_INT1_PIN);
                 break;
             case ESP_SLEEP_WAKEUP_EXT0:
                 ESP_LOGI(TAG, " 唤醒原因：IO%d 按键（手动触发）", BUTTON_PIN);

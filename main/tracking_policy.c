@@ -153,6 +153,24 @@ void track_note_manual_report(uint32_t now_s)
     s_last_report_s = now_s;
 }
 
+static RTC_DATA_ATTR uint8_t  s_prev_sleep_kind;
+static RTC_DATA_ATTR uint32_t s_prev_sleep_s;
+static RTC_DATA_ATTR bool     s_prev_hb_due;
+
+void track_note_sleep(track_sleep_kind_t kind, uint32_t sleep_s, bool hb_due)
+{
+    s_prev_sleep_kind = (uint8_t)kind;
+    s_prev_sleep_s    = sleep_s;
+    s_prev_hb_due     = hb_due;
+}
+
+track_sleep_kind_t track_last_sleep(uint32_t *sleep_s, bool *hb_due)
+{
+    if (sleep_s) *sleep_s = s_prev_sleep_s;
+    if (hb_due)  *hb_due  = s_prev_hb_due;
+    return (track_sleep_kind_t)s_prev_sleep_kind;
+}
+
 track_sleep_t track_sleep_plan(bool latched, uint32_t now_s)
 {
     const ct_cfg_t *c = ct_cfg();

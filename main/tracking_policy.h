@@ -83,6 +83,18 @@ typedef struct {
 
 track_sleep_t track_sleep_plan(bool latched, uint32_t now_s);
 
+/* 记住「上一觉是怎么睡的」（RTC 内存，深睡不丢），醒来打印唤醒原因时用：
+ * 同样是定时器叫醒，A 长睡到点 = 心跳到期，B 冷却到点 = 回来看这段时间有没有再动。 */
+typedef enum {
+    TRACK_SLEEP_NONE = 0,   /* 冷启动 / 没记录 */
+    TRACK_SLEEP_A,          /* A 长睡：ext1 开，定时到心跳 */
+    TRACK_SLEEP_B,          /* B 冷却：ext1 关，定时 check_s 或到下次能报运动 */
+    TRACK_SLEEP_POLL,       /* 轮询（CT_WAKE_EXT1=0） */
+} track_sleep_kind_t;
+
+void track_note_sleep(track_sleep_kind_t kind, uint32_t sleep_s, bool hb_due);
+track_sleep_kind_t track_last_sleep(uint32_t *sleep_s, bool *hb_due);
+
 /* 上报成功/失败的计数，只用于日志 */
 void     track_note_publish(bool ok);
 uint32_t track_cycles(void);
