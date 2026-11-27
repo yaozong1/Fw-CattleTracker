@@ -32,6 +32,27 @@ extern volatile bool  gnss_seen_gsa;
 
 // GNSS位置数据
 extern gnss_location_t gnss_last_location;
+
+/* 一个 GGA 历元：坐标和定位质量来自同一句 GGA，保证配套（2026-11-27）。
+ * 以前坐标取自 RMC、HDOP/卫星数取自「最近一句 GGA」，两者可能差一秒，
+ * 而且 RMC 已经 A 时 GGA 可能还是 0 颗卫星（#48 跳点）。 */
+typedef struct {
+    uint32_t seq;          /* 每解析一句 GGA +1（0 = 还没收到过） */
+    char     time_utc[16]; /* hhmmss.ss */
+    bool     has_pos;      /* GGA 里有经纬度 */
+    double   lat_deg;
+    double   lon_deg;
+    int      fixq;         /* 0 无效 / 1 GPS / 2 差分 / 4,5 RTK / 6 推算 */
+    int      sats;
+    float    hdop;         /* 没定位时模组给 99.99 */
+    bool     alt_valid;
+    float    alt_m;
+} gnss_gga_epoch_t;
+
+/* 拷贝最新一句 GGA（gnss_task 在别的任务里写，这里加锁拷贝）。没收到过返回 false */
+bool gnss_get_gga_epoch(gnss_gga_epoch_t *out);
+/* RMC 模式字段（NMEA 2.3+，第 12 个字段）：'A' 自主 'D' 差分 'E' 推算 'N' 无效，0 = 没有这个字段 */
+extern volatile char gnss_rmc_mode;
 extern gnss_location_t gnss_saved_location;
 
 // GNSS控制函数

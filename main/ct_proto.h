@@ -1,6 +1,7 @@
 #ifndef CT_PROTO_H
 #define CT_PROTO_H
 
+#include "gnss_module.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
@@ -21,8 +22,9 @@ typedef enum {
 typedef struct {
     ct_reason_t reason;
     bool        gnss_tried;   /* 本轮尝试过定位（没尝试 = 心跳配置成不开 GNSS） */
-    bool        fix_ok;       /* 本轮拿到了定位；位置取自 gnss_last_location / GGA 全局量 */
-    float       ttff_s;       /* 本轮从唤醒 GNSS 到定位的秒数 */
+    bool        fix_ok;       /* 本轮拿到了合格的定位；位置和质量取自下面的 fix（同一句 GGA） */
+    float       ttff_s;       /* 本轮从唤醒 GNSS 到「接受定位」的秒数 */
+    gnss_gga_epoch_t fix;     /* fix_ok 时：被接受的那一秒的 GGA（坐标、卫星数、HDOP、海拔） */
     const char *act_event;    /* "motion" / "still" / "doubt"，NULL = 不带 act */
     int         act_mg;       /* -1 = 本轮没采样 */
     int         still_min;    /* -1 = 开机以来还没判定过 motion，不带这个字段 */

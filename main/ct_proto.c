@@ -275,15 +275,17 @@ static char *build_telemetry(const ct_report_t *r, int rssi_dbm, uint32_t seq)
     cJSON_AddNumberToObject(o, "seq", seq);
     cJSON_AddStringToObject(o, "reason", ct_reason_str(r->reason));
 
-    if (r->fix_ok && gnss_last_location.valid) {
+    if (r->fix_ok && r->fix.has_pos) {
+        /* 坐标、海拔、HDOP、卫星数都取被接受的那一句 GGA（同一秒、配套）；
+         * 速度、航向只有 RMC 有，取最近一句 RMC */
         cJSON *g = cJSON_AddObjectToObject(o, "gps");
-        cJSON_AddNumberToObject(g, "lat", rnd(gnss_last_location.lat_deg, 1e6));
-        cJSON_AddNumberToObject(g, "lng", rnd(gnss_last_location.lon_deg, 1e6));
-        if (gnss_alt_valid) cJSON_AddNumberToObject(g, "alt", rnd(gnss_alt_m, 10));
+        cJSON_AddNumberToObject(g, "lat", rnd(r->fix.lat_deg, 1e6));
+        cJSON_AddNumberToObject(g, "lng", rnd(r->fix.lon_deg, 1e6));
+        if (r->fix.alt_valid) cJSON_AddNumberToObject(g, "alt", rnd(r->fix.alt_m, 10));
         cJSON_AddNumberToObject(g, "spd_kmh", rnd(gnss_last_location.spd_kn * 1.852, 10));
         cJSON_AddNumberToObject(g, "hdg", (int)(gnss_last_location.crs_deg + 0.5));
-        cJSON_AddNumberToObject(g, "hdop", rnd(gnss_hdop, 10));
-        cJSON_AddNumberToObject(g, "sats", gnss_sats);
+        cJSON_AddNumberToObject(g, "hdop", rnd(r->fix.hdop, 10));
+        cJSON_AddNumberToObject(g, "sats", r->fix.sats);
         if (r->ttff_s >= 0) cJSON_AddNumberToObject(g, "ttff_s", rnd(r->ttff_s, 10));
     } else {
         cJSON_AddNullToObject(o, "gps");

@@ -26,6 +26,19 @@ volatile bool gnss_seen_rmc = false;
 volatile bool gnss_seen_gga = false;
 volatile bool gnss_seen_gsa = false;
 volatile bool gnss_rmc_valid = false; // RMC: A=valid
+volatile char gnss_rmc_mode  = 0;     // RMC 模式字段 A/D/E/N，0 = 没有
+
+static gnss_gga_epoch_t s_gga;        // 最新一句 GGA（坐标 + 质量同源）
+static portMUX_TYPE     s_gga_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool gnss_get_gga_epoch(gnss_gga_epoch_t *out)
+{
+    if (!out) return false;
+    taskENTER_CRITICAL(&s_gga_mux);
+    *out = s_gga;
+    taskEXIT_CRITICAL(&s_gga_mux);
+    return out->seq != 0;
+}
 
 // TTFF（首次定位用时）测量标志
 static volatile bool       gnss_ttff_measuring = false;
@@ -149,6 +162,7 @@ void gnss_reset_state_for_ttff(void)
     gnss_seen_gga  = false;
     gnss_seen_gsa  = false;
     gnss_rmc_valid = false;
+    gnss_rmc_mode  = 0;
 
     gnss_ttff_measuring = true;
     gnss_ttff_start     = xTaskGetTickCount();
@@ -799,6 +813,9 @@ void gnss_parse_and_log_rmc(const char* nmea)
     GNSS_PARSE_LOG("RMC: time=%s status=%s lat=%s%s lng=%s%s spd(kn)=%s crs=%s", 
              time_utc, status, lat, lat_hemi, lng, lng_hemi, spd_kn, crs_deg);
 
+    /* 模式字段（NMEA 2.3+）：fields[12]，'E' = 推算位置，'N' = 无效 */
+    gnss_rmc_mode = (count > 12 && fields[12] && fields[12][0]) ? fields[12][0] : 0;
+
     // RMC 状态：A=有效，V=无效
     bool rmc_fix = (status && status[0] == 'A');
     static bool last_rmc_fix = false;
@@ -862,6 +879,31 @@ void gnss_parse_and_log_gga(const char* nmea)
     if (count > 9 && fields[9] && fields[9][0] && fixq > 0) {
         gnss_alt_m = (float)atof(fields[9]);
         gnss_alt_valid = true;
+    }
+
+    /* 同一句 GGA 的坐标 + 质量，存成一个历元给等定位逻辑用 */
+    {
+        gnss_gga_epoch_t e = {0};
+        const char *t = fields[1];
+        if (t) { strncpy(e.time_utc, t, sizeof(e.time_utc) - 1); }
+        const char *la = fields[2], *ns = fields[3], *lo = fields[4], *ew = fields[5];
+        if (la && *la && ns && *ns && lo && *lo && ew && *ew) {
+            e.lat_deg = nmea_coord_to_deg(la, ns[0], true);
+            e.lon_deg = nmea_coord_to_deg(lo, ew[0], false);
+            e.has_pos = true;
+        }
+        e.fixq = fixq;
+        e.sats = sats;
+        e.hdop = hdop;
+        if (count > 9 && fields[9] && fields[9][0] && fixq > 0) {
+            e.alt_valid = true;
+            e.alt_m = (float)atof(fields[9]);
+        }
+        taskENTER_CRITICAL(&s_gga_mux);
+        e.seq = s_gga.seq + 1;
+        if (e.seq == 0) e.seq = 1;
+        s_gga = e;
+        taskEXIT_CRITICAL(&s_gga_mux);
     }
 
     bool prev_fix = gnss_has_fix;

@@ -1149,6 +1149,90 @@ bool publish_gps_payload(void)
  */
 static volatile bool s_manual_pub_running = false;
 
+/* ================= 定位质量（2026-11-27） =================
+ * 判断一句 GGA（加上最近一句 RMC 的状态 / 模式）够不够格。合格返回 NULL，
+ * 不合格返回原因，并在 buf 里写带数字的说明（buf 可为 NULL）。门槛见 hardware_config.h。 */
+static const char *fix_reject_reason(const gnss_gga_epoch_t *e, char *buf, size_t n)
+{
+    char tmp[48] = "";
+    const char *why = NULL;
+
+    if (!e || e->seq == 0) {
+        why = "还没收到 GGA";
+    } else if (!e->has_pos || e->fixq <= 0) {
+        why = "GGA 还没定位";
+    } else if (e->fixq == 6) {
+        why = "GGA 是推算位置（质量 6）";
+    } else if (e->sats < CT_FIX_MIN_SATS) {
+        why = "卫星不够";
+        snprintf(tmp, sizeof(tmp), "卫星 %d < %d", e->sats, CT_FIX_MIN_SATS);
+    } else if (e->hdop <= 0.0f || e->hdop > CT_FIX_MAX_HDOP) {
+        why = "HDOP 太大";
+        snprintf(tmp, sizeof(tmp), "HDOP %.1f > %.1f", (double)e->hdop, (double)CT_FIX_MAX_HDOP);
+    } else if (!gnss_rmc_valid) {
+        why = "RMC 状态不是 A";
+    } else if (gnss_rmc_mode == 'E' || gnss_rmc_mode == 'N') {
+        why = "RMC 模式是推算/无效";
+        snprintf(tmp, sizeof(tmp), "RMC 模式 %c（推算/无效）", gnss_rmc_mode);
+    }
+
+    if (why && buf && n) {
+        strncpy(buf, tmp[0] ? tmp : why, n - 1);
+        buf[n - 1] = '\0';
+    }
+    return why;
+}
+
+/* 等一个合格定位：每来一句新的 GGA 判断一次，连续 CT_FIX_STABLE_S 句都合格才接受，
+ * 把最后那一句拷到 out。中间有一句不合格就重新计数。超时返回 false。
+ * 不合格原因变化时才打日志，避免每秒刷屏。 */
+static bool wait_for_good_fix(uint32_t timeout_ms, gnss_gga_epoch_t *out)
+{
+    TickType_t t0 = xTaskGetTickCount();
+    gnss_gga_epoch_t ep;
+    uint32_t last_seq = 0;
+    int good_run = 0;
+    char why[48] = "";
+    char last_why[48] = "";
+    int best_sats = -1;
+    float best_hdop = 0.0f;
+
+    while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(timeout_ms)) {
+        if (gnss_get_gga_epoch(&ep) && ep.seq != last_seq) {
+            last_seq = ep.seq;
+            if (fix_reject_reason(&ep, why, sizeof(why)) == NULL) {
+                good_run++;
+                ESP_LOGI("GPS", "  合格 %d/%d：卫星 %d  HDOP %.1f", good_run, CT_FIX_STABLE_S,
+                         ep.sats, (double)ep.hdop);
+                if (good_run >= CT_FIX_STABLE_S) {
+                    if (out) *out = ep;
+                    return true;
+                }
+                last_why[0] = '\0';
+            } else {
+                if (good_run > 0 || strcmp(why, last_why) != 0) {
+                    float t = (float)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS) / 1000.0f;
+                    ESP_LOGI("GPS", "  %.0f s：等稳定 —— %s%s", (double)t, why,
+                             good_run > 0 ? "（重新计数）" : "");
+                    strncpy(last_why, why, sizeof(last_why) - 1);
+                    last_why[sizeof(last_why) - 1] = '\0';
+                }
+                good_run = 0;
+            }
+            if (ep.has_pos && ep.fixq > 0 && ep.sats > best_sats) {
+                best_sats = ep.sats;
+                best_hdop = ep.hdop;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (best_sats >= 0) {
+        ESP_LOGW("GPS", "  超时：期间最好只有 卫星 %d / HDOP %.1f，不够格，不报这个位置",
+                 best_sats, (double)best_hdop);
+    }
+    return false;
+}
+
 static void manual_publish_task(void *pv)
 {
     (void)pv;
@@ -1190,12 +1274,15 @@ static void manual_publish_task(void *pv)
         step("模组开机(已开,跳过)");
     }
 
-    /* 手动上报不等定位：现在有有效定位就带上，没有就 gps=null（不带 fix_fail，因为没尝试） */
+    /* 手动上报不等定位：此刻最新这一秒的定位合格就带上，否则 gps=null（不带 fix_fail，因为没尝试） */
+    gnss_gga_epoch_t now_ep;
+    bool now_ok = gnss_get_gga_epoch(&now_ep) && fix_reject_reason(&now_ep, NULL, 0) == NULL;
     ct_report_t rp = {
         .reason     = CT_REASON_MANUAL,
         .gnss_tried = false,
-        .fix_ok     = gnss_rmc_valid && gnss_last_location.valid,
+        .fix_ok     = now_ok,
         .ttff_s     = -1.0f,
+        .fix        = now_ep,
         .act_event  = NULL,
         .act_mg     = -1,
         .still_min  = -1,
@@ -1498,21 +1585,20 @@ void gps_mqtt_cycle_task(void* pv)
 
             gnss_last_location.valid = false;
             gnss_reset_state_for_ttff();
-            ESP_LOGI("GPS", "等定位（%s，超时 %lu s）...", track_report_str(td.report),
-                     (unsigned long)td.fix_timeout_sec);
+            ESP_LOGI("GPS", "等定位（%s，超时 %lu s；要求卫星>=%d、HDOP<=%.1f、连续 %d s）...",
+                     track_report_str(td.report), (unsigned long)td.fix_timeout_sec,
+                     CT_FIX_MIN_SATS, (double)CT_FIX_MAX_HDOP, CT_FIX_STABLE_S);
             TickType_t t0 = xTaskGetTickCount();
-            while ((xTaskGetTickCount() - t0) < pdMS_TO_TICKS(td.fix_timeout_sec * 1000U)) {
-                if (gnss_last_location.valid) { break; }
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
+            bool accepted = wait_for_good_fix(td.fix_timeout_sec * 1000U, &rp.fix);
             rp.gnss_tried = true;
 
-            if (gnss_last_location.valid) {
+            if (accepted) {
                 rp.fix_ok = true;
                 rp.ttff_s = (float)((xTaskGetTickCount() - t0) * portTICK_PERIOD_MS) / 1000.0f;
+                gnss_last_location.lat_deg = rp.fix.lat_deg;   /* 让其它地方看到的也是这一点 */
+                gnss_last_location.lon_deg = rp.fix.lon_deg;
                 ESP_LOGI("GPS", "定位：%.6f, %.6f  卫星 %d  HDOP %.1f  用时 %.1f s",
-                         gnss_last_location.lat_deg, gnss_last_location.lon_deg,
-                         gnss_sats, gnss_hdop, rp.ttff_s);
+                         rp.fix.lat_deg, rp.fix.lon_deg, rp.fix.sats, rp.fix.hdop, rp.ttff_s);
                 if (!ct_time_from_gnss()) {
                     ESP_LOGW("GPS", "RMC 没有日期，本轮不用 GNSS 校时");
                 }
@@ -1520,7 +1606,7 @@ void gps_mqtt_cycle_task(void* pv)
                 app_note_fix_ok();
 #endif
             } else {
-                ESP_LOGW("GPS", "%lu s 内没有定位 —— 照样上报（gps=null, fix_fail）",
+                ESP_LOGW("GPS", "%lu s 内没有合格定位 —— 照样上报（gps=null, fix_fail）",
                          (unsigned long)td.fix_timeout_sec);
             }
         } else {

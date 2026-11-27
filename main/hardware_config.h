@@ -812,7 +812,7 @@
  * 业务代码通过 ct_cfg() 取值，不直接用这些宏。
  * ========================================================================== */
 #ifndef CT_FW_VERSION
-#define CT_FW_VERSION "0.4.0-p1"
+#define CT_FW_VERSION "0.4.1-p1"
 #endif
 
 /* ---- 深睡唤醒方式 ----
@@ -848,6 +848,22 @@
 #endif
 
 /* SUBACK 之后等 retained 下行的时间（协议 §6） */
+/* ---- 定位质量门槛（2026-11-27）----
+ * 等定位时每秒看一句 GGA，同时满足才算「好」，连续 CT_FIX_STABLE_S 秒都好才接受：
+ *   GGA 定位质量 >= 1 且不是 6（推算）、卫星 >= CT_FIX_MIN_SATS、0 < HDOP <= CT_FIX_MAX_HDOP、
+ *   RMC 状态 A 且模式不是 E / N。
+ * 超时还达不到 → 按定位失败上报（fix_fail），不报质量差的位置。
+ * 实测（11-26 户外）：0 颗 / 3 颗卫星的定位偏了 300~600 m，好的定位 6~11 颗、HDOP 1~2.8。 */
+#ifndef CT_FIX_MIN_SATS
+#define CT_FIX_MIN_SATS 5
+#endif
+#ifndef CT_FIX_MAX_HDOP
+#define CT_FIX_MAX_HDOP 3.0f
+#endif
+#ifndef CT_FIX_STABLE_S
+#define CT_FIX_STABLE_S 3
+#endif
+
 #ifndef CT_DOWNLINK_WAIT_MS
 #define CT_DOWNLINK_WAIT_MS 3000
 #endif
